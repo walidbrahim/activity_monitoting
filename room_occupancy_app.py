@@ -13,7 +13,11 @@ import matplotlib.patches as patches
 import matplotlib.transforms as mtransforms
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import FancyBboxPatch, Wedge, Circle
-matplotlib.use('TkAgg')
+import platform
+if platform.system() == 'Darwin':
+    matplotlib.use('MacOSX')
+else:
+    matplotlib.use('TkAgg')
 import requests
 import threading
 import serial
@@ -62,8 +66,12 @@ RANGE_RESOLUTION = 0.15
 FRAME_RATE = 25
 RANGE_IDX_NUM = 35
 TI_1DFFT_QUEUE_LEN = 25
-TI_CLI_SERIAL_PORT = '/dev/ttyUSB0'
-SERIAL_PORT_NAME = '/dev/ttyUSB1'
+if platform.system() == 'Darwin':
+    TI_CLI_SERIAL_PORT =  "/dev/cu.usbserial-00E243020"  
+    SERIAL_PORT_NAME ="/dev/cu.usbserial-00E243021"      
+else:
+    TI_CLI_SERIAL_PORT =  "/dev/ttyUSB0"
+    SERIAL_PORT_NAME ="/dev/ttyUSB1"
 MAGIC_WORD = [0x708050603040101, 0x708050603040102, 0x708050603040103, 0x708050603040104,
                       0x708050603040105, 0x708050603040106, 0x708050603040107, 0x708050603040108]
 START_FREQUENCY = 60  # GHz   
