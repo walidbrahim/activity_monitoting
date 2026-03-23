@@ -1,0 +1,6 @@
+numpy
+matplotlib
+pyserial
+pandas
+requests
+scipy
