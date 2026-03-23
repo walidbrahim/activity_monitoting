@@ -1,0 +1,35 @@
+graph TD
+    subgraph "Step 8: Confidence Index Generation"
+        Input8["<b>Input:</b> posture, height, thresholds, status, track_confidence,<br/>miss_counter, motion_level, dynamic_mag"] --> OccConf
+        
+        OccConf["<b>Occupancy Confidence</b><br/>Temporal: based on hit/miss track confidence"]
+        OccConf --> OccSignal["Adjust signal confidence based on status:<br/>Active (Mag above thresh)<br/>Apnea (Raw difference above margin)"]
+        OccSignal --> OccFinal["Weight and sum Temporal & Signal."]
+        OccFinal --> OccPenalty["Subtract penalty for active misses"]
+        
+        OccPenalty --> PostureConf["<b>Posture Confidence</b><br/>Distance from current height to nearest thresh boundary"]
+        PostureConf --> PosturePenalty["Subtract penalty based on high motion level"]
+    end
+    
+    PosturePenalty --> Input9["<b>Input:</b> Final stable zone, is_valid_point, output_dict"]
+    
+    subgraph "Step 9: Zone Timer Update"
+        Input9 --> CallTimer["Call _update_zone_timer with stable zone and validity"]
+        
+        subgraph "_update_zone_timer internal logic"
+            CallTimer --> New{"Zone changed?"}
+            New -- Yes --> StartT["Store start time"]
+            New -- No --> UpSeen["Update last_seen time"]
+            
+            StartT --> Dropout{"Valid Point False?"}
+            UpSeen --> Dropout
+            
+            Dropout -- Yes --> Hold{"Wait now - last_seen > <br/>zone_timer_hold_sec (3.0s)?"}
+            Hold -- Yes --> KillTimer["Reset Timer (None)"]
+            Hold -- No --> OutputU
+            Dropout -- No --> OutputU["Update Status"]
+        end
+        
+        KillTimer --> OutputFinalCompile
+        OutputU --> OutputFinalCompile["Format duration string,<br/>Compile final output_dict"]
+    end

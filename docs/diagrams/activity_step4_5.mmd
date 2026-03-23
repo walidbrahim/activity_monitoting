@@ -1,0 +1,30 @@
+graph TD
+    subgraph "Step 4: Outlier Rejection (Teleportation Guard)"
+        Input4["<b>Input:</b> raw_x, raw_y, smoothed_x, smoothed_y,<br/>is_valid_point, status"] --> CondTele{"Point Valid?<br/>Track Exists?<br/>Not Apnea state?"}
+
+        CondTele -- Yes --> CalcJump[Calculate horizontal jump distance]
+        CalcJump --> JumpGate{"Jump > 1.5m?"}
+        JumpGate -- Yes --> Reject["is_valid_point = False"]
+        JumpGate -- No --> OutputValid["Update is_valid_point"]
+        CondTele -- No --> OutputValid
+    end
+    
+    OutputValid --> Input5["<b>Input:</b> updated is_valid_point,<br/>track_confidence, miss_counter"]
+    
+    subgraph "Step 5: Temporal Persistence (Hit/Miss Tracking)"
+        Input5 --> DecVal{"Point Valid?"}
+        
+        DecVal -- Yes --> Hit["Increment track_confidence<br/>(cap threshold)<br/>miss_counter = 0"]
+        Hit --> BuffCoord["Push (raw_x,y,z) to coord_buffer (FIFO)"]
+        
+        DecVal -- No --> Miss["Increment miss_counter"]
+        Miss --> MissGate{"miss_counter > <br/>Miss Allowance?"}
+        MissGate -- Yes --> TargetLost["Reset occupation state (False)<br/>Clear tracks, buffers, history"]
+        TargetLost --> CallEmpty["Call empty_room()<br/>Exit process_frame"]
+        
+        BuffCoord --> TrackCheck{"Track Confidence >= <br/>Confidence Threshold?"}
+        MissGate -- No --> TrackCheck
+        
+        TrackCheck -- Yes --> Output5["<b>Proceed to Step 6</b>"]
+        TrackCheck -- No --> CallEmpty
+    end

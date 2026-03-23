@@ -1,0 +1,45 @@
+graph TD
+    Input[<b>Input:</b> fft_1d_data] --> Init[Increment Frame Count<br/>Copy data]
+    Init --> PhaseFlip[<b>Apply Phase Flip</b><br/>Multiply channels 0,2,4,6 by -1]
+    PhaseFlip --> CalcRawMag["Calculate Raw Magnitude Profile<br/>(Sum abs complex data across channels)"]
+    
+    subgraph "Baseline Profile Management"
+        CalcRawMag --> DecBase{"1. Baseline exists?<br/>2. Room occupied?<br/>3. Warmup finished?"}
+        DecBase -- Yes to all --> SlowEMABase["Update Baseline via slow EMA:<br/>0.01 * Raw + 0.99 * OldBase"]
+        DecBase -- No --> SetBase{"Is Base None?"}
+        SetBase -- Yes --> SnapBase[Initialize Baseline = Raw Profile]
+        SetBase -- No --> NoOp1[No action]
+    end
+    
+    subgraph "Dynamic Clutter Filter"
+        SlowEMABase --> DetAlpha[Determine Clutter Alpha]
+        NoOp1 --> DetAlpha
+        SnapBase --> DetAlpha
+        
+        DetAlpha -- Warmup --> A1[Alpha = 0.3]
+        DetAlpha -- Occupied --> A2[Alpha = 0.01]
+        DetAlpha -- Empty --> A3[Alpha = 0.05]
+        
+        A1 --> UpdateClutter[Update Clutter Map complex EMA]
+        A2 --> UpdateClutter
+        A3 --> UpdateClutter
+        
+        UpdateClutter --> Subtract["<b>Subtract Clutter</b><br/>DynamicData = Corrected - ClutterMap"]
+        Subtract --> DynMag[Calculate Dynamic Magnitude Profile]
+    end
+    
+    subgraph "History Buffers & Warmup Exit"
+        DynMag --> CheckWarm["Is current frame > Warmup Frames?"]
+        
+        CheckWarm -- Yes --> Hist["Roll & Push complex sums to <br/>complex_history & spectral_history"]
+        CheckWarm -- No --> CalStatus[Set Output Status = Calibrating]
+        CalStatus --> CheckEnd["Is current frame == Warmup Frames?"]
+        CheckEnd -- Yes --> FinalBase[Snapshot Raw to Baseline]
+        CheckEnd -- No --> ExitCal[Return Output Dict]
+        FinalBase --> ExitCal
+    end
+    
+    Hist --> FinalWarmExit{"Is frame == Warmup + Vital Gate + 1?"}
+    FinalWarmExit -- Yes --> ClearTrack["Clear existing Track Coords/Buffer<br/>(Ready for fresh vital gating)"]
+    FinalWarmExit -- No --> Output1["<b>Output:</b> dynamic_data,<br/>dynamic_mag_profile"]
+    ClearTrack --> Output1

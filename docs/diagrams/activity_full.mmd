@@ -1,0 +1,31 @@
+graph TD
+    Input["<b>Input:</b> raw fft_1d_data <br/>(1xChannels per range bin)"] --> Step1
+    
+    subgraph "Per-Frame Processing Loop (process_frame)"
+        Step1["<b>1. Hardware Correction & Background</b><br/>Apply Phase Flip, Update Clutter/Baseline, <br/>Subtract Static Environment"] --> Cond1
+        
+        Cond1{"Is Warmup<br/>Active?"} -- Yes --> OutputCal["Output: Status=Calibrating"]
+        Cond1 -- No --> Step2
+        
+        Step2["<b>2. Spatial Candidate Selection</b><br/>Find Peaks, Compute Angle/3D Coords,<br/>Project to Room, Vital Sign Gating,<br/>Score & Select Best Candidate"] --> Step3
+        
+        Step3["<b>3. State Machine (Occupancy)</b><br/>Determine Status: <br/>Active/Breathing, Apnea/Still, Exit, or Empty"] --> Cond2
+        
+        Cond2{"Is Room<br/>Empty/Target Lost?"} -- Yes --> OutputEmpty["Output: Empty Room Dict"]
+        Cond2 -- No --> Step4
+        
+        Step4["<b>4. Outlier Rejection</b><br/>Prevent Teleportation<br/>(Reject large frame-to-frame jumps)"] --> Step5
+        
+        Step5["<b>5. Temporal Persistence (Hit/Miss)</b><br/>Update Track Confidence,<br/>Handle Signal Dropouts via Miss Allowance"] --> Cond3
+        
+        Cond3{"Target Lost<br/>(Miss Allowance Exceeded)?"} -- Yes --> OutputEmpty
+        Cond3 -- No --> Step6
+        
+        Step6["<b>6. Smoothing & Fall Metrics</b><br/>Median Filter Buffer, Adaptive EMA Smoothing,<br/>Update Z-History, Calculate Vertical Velocity"] --> Step7
+        
+        Step7["<b>7. Posture, Zone & Falls</b><br/>Determine Zone & Debounce, Identify Posture<br/>Tag Motion, Trigger Critical Fall Logic"] --> Step8
+        
+        Step8["<b>8. Confidence Index Gen</b><br/>Generate Occupancy Confidence,<br/>Generate Posture Confidence"] --> Step9
+        
+        Step9["<b>9. Zone Timer Update</b><br/>Track Time Spent in Current Stable Zone,<br/>Format Duration String"] --> OutputFinal["<b>Output:</b> output_dict<br/>(X,Y,Z, Zone, Status, Confidences, Posture, Duration)"]
+    end

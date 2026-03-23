@@ -1,0 +1,44 @@
+graph TD
+    Input7["<b>Input:</b> Smoothed X,Y,Z, v_z, motion_level,<br/>is_fallen, persistence_frames, status"] --> ReZone
+    
+    subgraph "Zone Debouncing"
+        ReZone["Call evaluate_spatial_zone with smoothed coords"]
+        ReZone --> CheckStable["Is Zone != current_stable_zone?"]
+        CheckStable -- Yes --> PushHist["Push to zone_history"]
+        PushHist --> Persist{"Did new zone persist<br/>for FRAME_TO_CONFIRM_ZONE frames?"}
+        Persist -- Yes --> SetStable["Set current_stable_zone = New Zone"]
+        Persist -- No --> KeepStable["Final Zone = current_stable_zone"]
+        SetStable --> KeepStable
+        CheckStable -- No --> ClearHist["Clear zone_history"]
+        ClearHist --> KeepStable
+    end
+    
+    subgraph "Basic Posture & Motion Tagging"
+        KeepStable --> PostureLogic["<b>Posture Recognition</b><br/>Height > Stand Thresh: Standing<br/>Height > Sit Thresh: Sitting<br/>Else: Lying Down"]
+        PostureLogic --> MotionLogic["<b>Motion Tagging</b><br/>If Apnea status: Static<br/>Else if Motion < REST_MAX: Resting<br/>Else if Motion < RESTLESS: Restless<br/>Else: Major Movement"]
+    end
+    
+    subgraph "Critical Fall Logic & Overrides"
+        MotionLogic --> ZoneGate{"Final Zone is<br/>Ignored/Ghost?"}
+        
+        ZoneGate -- Yes --> KillTrack["KILL TRACK IMMEDIATELY.<br/>Return Lost Status."]
+        
+        ZoneGate -- No --> FloorGate{"Final Zone is Floor/Transit?"}
+        
+        FloorGate -- Yes --> FloorAdjust["Update status to 'In Room'"]
+        FloorAdjust --> HeightGate{"Height <= <br/>Fall Threshold?"}
+        HeightGate -- Yes --> VelocityGate{"v_z <= Fall Velocity Thresh OR<br/>already is_fallen latched?"}
+        VelocityGate -- Yes --> Fallen["Latch is_fallen=True,<br/>Increment persistence_frames"]
+        Fallen --> ScoreFall["<b>Calculate Fall Confidence (Weighted)</b><br/>Height Score (closer to floor) + Time Score (longer duration)"]
+        ScoreFall --> CritGate{"Confidence > 60%?"}
+        CritGate -- Yes --> SetCritFall["status=CRITICAL Fall Detected,<br/>posture=Fallen"]
+        CritGate -- No --> Output7
+        
+        VelocityGate -- No --> SitFloor["Sitting slowly on floor.<br/>is_fallen=False, decrement persistence"]
+        SitFloor --> Output7
+        HeightGate -- No --> ResetFall["Reset fall logic<br/>is_fallen=False, persistence=0"]
+        ResetFall --> Output7
+        
+        FloorGate -- No --> BedResetFall["Person safe in bed/chair.<br/>Reset fall logic."]
+        BedResetFall --> Output7
+    end

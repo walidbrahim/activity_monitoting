@@ -1,0 +1,33 @@
+graph TD
+    Input["<b>Input:</b> current peak bin, raw/dyn mag profiles,<br/>baseline profile, is_occupied status"] --> DynCheck
+    
+    DynCheck{"Is Dynamic Mag >= <br/>Detection Threshold?"}
+    
+    DynCheck -- Yes --> S1["    <b>STATE: Active/Breathing</b>"]
+    S1 --> S1_Set["is_occupied=True,<br/>status=Occupied (Breathing/Moving)"]
+    S1_Set --> OutputMachine["<b>Output:</b> status,<br/>updated raw x,y,z if Apnea"]
+    
+    DynCheck -- No --> ApneaGate{"Is Room Occupied?<br/>Is previous bin known?"}
+    
+    ApneaGate -- Yes --> CheckStill["Calculate Diff = Raw - Baseline at old bin"]
+    ApneaGate -- No --> S4["<b>STATE: Truly Empty</b>"]
+    
+    CheckStill --> StillGate{"Is Diff > <br/>Static Margin?"}
+    StillGate -- Yes --> S2["<b>STATE: Stillness/Apnea</b>"]
+    S2 --> CheckTrack{"Smoothed Track Exists?"}
+    CheckTrack -- Yes --> S2_UseTrack["raw x,y,z = Smoothed Track Coords"]
+    CheckTrack -- No --> S2_Buffer{"Coords in Buffer?"}
+    S2_Buffer -- Yes --> S2_UseBuff["raw x,y,z = Last Buffered Coords"]
+    S2_Buffer -- No --> ExitState
+    S2_UseTrack --> S2_SetStatus["status=Still / Possible Apnea"]
+    S2_UseBuff --> S2_SetStatus
+    S2_SetStatus --> OutputMachine
+    
+    StillGate -- No --> S3["<b>STATE: Confirmed Exit</b>"]
+    S3 --> ExitActions["Clear state (is_occupied=False,<br/>clear tracks, clear history)"]
+    ExitActions --> LearnEmpty["<b>Snapshot Raw to Baseline</b><br/>(Forces re-calibration on empty state)"]
+    LearnEmpty --> ExitEmpty
+    ExitState --> LearnEmpty
+    S4 --> ExitEmpty
+    
+    ExitEmpty["Call empty_room()<br/>Exit process_frame"]
