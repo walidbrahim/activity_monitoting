@@ -657,27 +657,6 @@ class ActivityPipeline:
 
                 # --- VITAL CONTENT GATING ---
                 vital_multiplier = 0.1
-                # Wait until buffer is full AFTER the warmup phase
-                # if (self.frame_count - self.warmup_frames) > self.vital_gate_frames:
-                #     # Look at the phase history for this specific candidate bin
-                #     cand_history = self.complex_history[cand_bin, :]
-                    
-                #     # Prevent np.angle(0) warning by adding a tiny epsilon if perfectly static
-                #     cand_history_safe = np.where(cand_history == 0, 1e-10 + 1e-10j, cand_history)
-                    
-                #     cand_phase = np.unwrap(np.angle(cand_history_safe))
-                #     phase_ptp = np.ptp(cand_phase) # Peak-to-peak phase shift
-
-                #     # Gate Logic based on phase_ptp only:
-                #     if phase_ptp < 3:
-                #         vital_multiplier = 0.05    # Static ghost
-                #     elif phase_ptp < 6.0:
-                #         vital_multiplier = 1.0     # Biological range (breathing + small motion)
-                #     elif phase_ptp < 15.0:
-                #         vital_multiplier = 0.7     # Active motion (still likely a person)
-                #     else:
-                #         vital_multiplier = 0.1     # Very chaotic (could be interference)
-
                 if (self.frame_count - self.warmup_frames) > self.spectral_frames:
                     cand_history = self.spectral_history[cand_bin, :]
                     cand_history_safe = np.where(cand_history == 0, 1e-10 + 1e-10j, cand_history)
@@ -794,7 +773,7 @@ class ActivityPipeline:
         self.output_dict["Range"] = dynamic_peak_bin * self.range_res
  
         # ==========================================
-        # Step 3: State Machine & Spatial Math
+        # Step 3: State Machine
         # ==========================================       
         # 1. Check if the peak we found in Step 2 is strong enough to be "Active"
         print(f"[Threshold] dynamic_mag={dynamic_mag_profile[dynamic_peak_bin]:.1f}, threshold={self.detection_threshold}")
@@ -845,15 +824,15 @@ class ActivityPipeline:
             self.empty_room()
             return self.output_dict
 
-        # ==========================================
-        # Step 4: Outlier Rejection (Movement Logic)
-        # ==========================================        
-        # 1. TELEPORTATION CHECK
-        # If the dot jumps more than 1.5 meters in 1/10th of a second, it's a glitch.
-        if is_valid_point and self.track_x is not None and "Apnea" not in status:
-            jump_distance = np.sqrt((raw_x - self.track_x)**2 + (raw_y - self.track_y)**2)
-            if jump_distance > 1.5:  
-                is_valid_point = False 
+        # # ==========================================
+        # # Step 4: Outlier Rejection (Movement Logic)
+        # # ==========================================        
+        # # 1. TELEPORTATION CHECK
+        # # If the dot jumps more than 1.5 meters in 1/10th of a second, it's a glitch.
+        # if is_valid_point and self.track_x is not None and "Apnea" not in status:
+        #     jump_distance = np.sqrt((raw_x - self.track_x)**2 + (raw_y - self.track_y)**2)
+        #     if jump_distance > 1.5:  
+        #         is_valid_point = False 
 
         # ==========================================
         # Step 5: Temporal Persistence (Hit/Miss)
