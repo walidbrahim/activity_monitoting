@@ -40,13 +40,13 @@ LAYOUT = {
         "fov_deg": 120
     },
     "Bed": {
-        "type": "bed", 
+        "type": "monitor", 
         "x": [0.0, 1.05], "y": [1.45, 3.5], "z": [0, 2.7],
         "margin_x": [0.3, 0.3], # 0.3 at the left/right
         "margin_y": [0.3, 0]  # 0.3 at the footer
     },
     "Desk": {
-        "type": "monitor", # Standard bounding box, no sub-LAYOUT
+        "type": "ignore", # Standard bounding box, no sub-LAYOUT
         "x": [1.95, 2.58], "y": [1.6, 2.64], "z": [0, 1.2]
     },
     "Chair": {
@@ -89,15 +89,15 @@ RX_ANT = 4
 DETECTION_THRESHOLD = 150.0   # Threshold for detecting a moving object
 STATIC_MARGIN = 200            # How much raw signal a static body adds over the empty bed
 ALPHA = 0.05                  # Moving average filter coefficient
-TRACK_ALPHA = 0.05             # Coordinate smoothing factor (lower = smoother but slower to update)
-FRAME_TO_CONFIRM_ZONE = 25    # Require 1 second (25 frames) of stability to change LAYOUT
-BUFFER_SIZE = 25              # Buffer size for coordinate tracking
-MISS_ALLOWANCE = 50           # Allow 50 frames of no detection before clearing the track
+TRACK_ALPHA = 0.2             # Coordinate smoothing factor (lower = smoother but slower to update)
+FRAME_TO_CONFIRM_ZONE = 50    # Require 1 second (25 frames) of stability to change LAYOUT
+BUFFER_SIZE = 10              # Buffer size for coordinate tracking
+MISS_ALLOWANCE = 25           # Allow 50 frames of no detection before clearing the track
 
+# Posture parameters
 FALL_DETECTION_ENABLE = True
-FALL_DURATION = 2 # seconds
-FALL_THRESHOLD = 0.5
-FALL_VELOCITY_THRESHOLD = 0
+FALL_THRESHOLD = 0.5    # m
+FALL_VELOCITY_THRESHOLD = -1.2   # m/s
 
 SITTING_THRESHOLD = 0.6 
 STANDING_THRESHOLD = 1.1
@@ -106,10 +106,13 @@ STANDING_THRESHOLD = 1.1
 REST_MAX = 0.1
 RESTLESS_MAX = 0.3
 
+# Respiration Processing
+RESP_WINDOW_SEC = 30 # seconds
+
 # Others
 LOG_LEVEL = 10
 NEED_SEND_TI_CONFIG = True
-SEND_ALERT = False
+SEND_ALERT = False    # Send alert to phone/watch
 
 # GUI Theme
 FIG_BG = "#111827"
@@ -402,7 +405,6 @@ class ActivityPipeline:
         self.is_fallen = False             # Latching boolean for fall state
 
         # Warmup Parameters
-        self.frame_count = 0
         self.warmup_frames = FRAME_RATE * 1 
         
         # Vital Gating History Buffer
@@ -411,31 +413,83 @@ class ActivityPipeline:
         self.complex_history = np.zeros((self.num_range_bins, self.vital_gate_frames), dtype=complex)
 
         # 10 seconds of history for high-res breathing extraction
-        self.spectral_frames = 10 * FRAME_RATE 
+        self.spectral_frames = RESP_WINDOW_SEC * FRAME_RATE 
         self.spectral_history = np.zeros((self.num_range_bins, self.spectral_frames), dtype=complex)
 
         self.output_dict = {}
+        self.apnea_frames = 0
+        self.entry_frames = 0
+        self.frames_to_occupy = int(FRAME_RATE * 3.0)
         self.empty_room()
 
     def _score_candidates(self, candidates, max_mag, use_tethering):
         best, best_s = None, -float('inf')
+        
+        # --- THE ESCAPE CLAUSE ---
+        # Only apply strict bed physics if they are in the bed AND lying down
+        track_in_monitor = False
+        if self.track_x is not None and self.current_active_zone is not None:
+            is_bed_zone = "Bed" in self.current_active_zone or "monitor" in self.current_active_zone.lower()
+            is_lying_down = getattr(self, 'track_z', 0.0) < SITTING_THRESHOLD
+            
+            if is_bed_zone and is_lying_down:
+                track_in_monitor = True
+
         for c in candidates:
-            s = (c['mag'] / max_mag) * c['vital_mult']
-            # Zone preference bonus
+            # Base score: heavily normalize the magnitude so it doesn't overpower vitals
+            mag_ratio = c['mag'] / max_mag
+            
+            # --- 1. VITAL OVERRIDE (Focus on the Chest) ---
+            if track_in_monitor:
+                # If they are in bed, we don't care how "loud" the reflection is.
+                # We care almost exclusively about how rhythmic it is.
+                s = (mag_ratio * 0.2) + (c['vital_mult'] * 2.0) 
+            else:
+                # Standard scoring for walking around the room
+                s = mag_ratio * c['vital_mult']
+            
+            # Zone preference bonus   # TODO: make it relative to the zone type not the name
             if c['zone'] not in ('Floor / Transit', 'Out of Bounds (Ghost)'):
                 s += 0.15
-            # Spatial tethering (only when enabled AND track exists)
+                
+            # --- 2. STICKY BIN BONUS ---
+            if use_tethering and self.is_occupied and self.last_target_bin is not None:
+                bin_distance = abs(c['bin'] - self.last_target_bin)
+                if bin_distance == 0:
+                    s += 0.50  # Center of the chest
+                elif bin_distance == 1:
+                    s += 0.25  # Edge of the chest (safe 15cm slide)
+
+            # --- 3. ANATOMY TETHERING ---
             if use_tethering and self.track_x is not None:
                 xy_dist = np.sqrt((c['x'] - self.track_x)**2 + (c['y'] - self.track_y)**2)
-                s -= min(0.4, xy_dist * 0.3)
+                
+                if track_in_monitor:
+                    # STRICT TETHER: The person is lying down. The center of mass 
+                    # should absolutely not jump 1 meter to the feet.
+                    if xy_dist > 0.4: # > 40 cm jump (e.g., jumping from chest to knees)
+                        s -= 2.0      # Massive penalty. Kills the candidate entirely.
+                    elif xy_dist > 0.15:
+                        s -= min(0.8, (xy_dist - 0.15) * 1.5)
+                else:
+                    # LOOSE TETHER: They are walking around the room. 
+                    # Allow larger jumps for normal gait speed.
+                    if xy_dist > 0.15: 
+                        s -= min(0.4, (xy_dist - 0.15) * 0.4)
+                    
+                # Penalize vertical jumps (people don't suddenly teleport to the ceiling)
                 z_jump = abs(c['z'] - self.track_z)
-                s -= min(0.2, z_jump * 0.5)
+                s -= min(0.3, z_jump * 0.5)
+                
             if s > best_s:
                 best_s = s
                 best = c
+                
         return best, best_s
 
     def empty_room(self):
+        self.motion_level = 0.0
+        self.current_micro_state = "STABLE"
         self.output_dict = {
             "X": None,
             "Y": None,
@@ -451,6 +505,7 @@ class ActivityPipeline:
             "motion_str": "",
             "duration_str": "",
             "fall_confidence": 0,
+            "micro_state": "STABLE",
         }
 
     def _update_zone_timer(self, zone_name, valid_detection, now):
@@ -496,69 +551,56 @@ class ActivityPipeline:
 
     def evaluate_spatial_zone(self, x, y, z):
         """
-        Evaluates a 3D point against the defined geofences.
+        Evaluates a 3D point against the defined geofences efficiently.
         Returns: (Zone String, is_valid_target)
         """
-        # 1. Global Boundary Check
+        # 1. Global Boundary Check (Fast Fail)
         room = LAYOUT.get("Room")
         if room:
             if not (room["x"][0] <= x <= room["x"][1] and 
                     room["y"][0] <= y <= room["y"][1] and 
                     room["z"][0] <= z <= room["z"][1]):
                 return "Out of Bounds (Ghost)", False
-                    
-        # 2. Interference Check (Are they in a 'Keep-Out' zone?)
-        for name, bounds in LAYOUT.items():
-            if bounds["type"] == "ignore":
-                # Check if the X, Y, Z coordinates fall inside this ignore box
-                in_x = bounds["x"][0] <= x <= bounds["x"][1]
-                in_y = bounds["y"][0] <= y <= bounds["y"][1]
-                in_z = bounds["z"][0] <= z <= bounds["z"][1]
                 
-                if in_x and in_y and in_z:
-                    # The point is inside a noise source! Tell the pipeline to reject it.
+        # 2. Strict Interference Check
+        # We process 'ignore' zones first so they safely override overlapping target zones
+        for name, bounds in LAYOUT.items():
+            if bounds.get("type") == "ignore":
+                if (bounds["x"][0] <= x <= bounds["x"][1] and
+                    bounds["y"][0] <= y <= bounds["y"][1] and
+                    bounds["z"][0] <= z <= bounds["z"][1]):
                     return f"Ignored ({name})", False
 
-        # 3. Dynamic Bed & Sub-Zone Check
+        # 3. Target Zone Check (Beds and Monitors)
         for name, bounds in LAYOUT.items():
-            if bounds["type"] == "bed":
-                # Check if the person is inside the overall 3D bed box
+            zone_type = bounds.get("type")
+            
+            if zone_type == "monitor":
                 if (bounds["x"][0] <= x <= bounds["x"][1] and
                     bounds["y"][0] <= y <= bounds["y"][1] and
                     bounds["z"][0] <= z <= bounds["z"][1]):
                     
-                    # They are in the bed! Now calculate exactly where.
-                    x_min, x_max = bounds["x"]
-                    y_min, y_max = bounds["y"]
-                    m_x = bounds.get("margin_x", [0.2, 0.2]) # Default to 20cm if not provided
-                    m_y = bounds.get("margin_y", [0.2, 0.2])
-                    
-                    # Are they safely inside the center margins?
-                    is_center_x = (x_min + m_x[0]) <= x <= (x_max - m_x[1])
-                    is_center_y = (y_min + m_y[0]) <= y <= (y_max - m_y[1])
-                    
-                    if is_center_x and is_center_y:
-                        return f"{name} - Center", True
-                    elif x < (x_min + m_x[0]):
-                        return f"{name} - Right Edge", True
-                    elif x > (x_max - m_x[1]):
-                        return f"{name} - Left Edge", True
-                    elif y < (y_min + m_y[0]):
-                        return f"{name} - Foot Edge", True 
-                    elif y > (y_max - m_y[1]):
-                        return f"{name} - Head Edge", True 
-                    else:
-                        return f"{name} - Corner", True
-
-        # 4. Standard Furniture Check ("monitor")
-        for name, bounds in LAYOUT.items():
-            if bounds["type"] == "monitor":
-                if (bounds["x"][0] <= x <= bounds["x"][1] and
-                    bounds["y"][0] <= y <= bounds["y"][1] and
-                    bounds["z"][0] <= z <= bounds["z"][1]):
+                    if name == "Bed":
+                        # They are in the bed; calculate the sub-zone
+                        x_min, x_max = bounds["x"]
+                        y_min, y_max = bounds["y"]
+                        m_x = bounds.get("margin_x", [0.2, 0.2]) 
+                        m_y = bounds.get("margin_y", [0.2, 0.2])
+                        
+                        is_center_x = (x_min + m_x[0]) <= x <= (x_max - m_x[1])
+                        is_center_y = (y_min + m_y[0]) <= y <= (y_max - m_y[1])
+                        
+                        if is_center_x and is_center_y: return f"{name} - Center", True
+                        elif x < (x_min + m_x[0]):      return f"{name} - Right Edge", True
+                        elif x > (x_max - m_x[1]):      return f"{name} - Left Edge", True
+                        elif y < (y_min + m_y[0]):      return f"{name} - Foot Edge", True 
+                        elif y > (y_max - m_y[1]):      return f"{name} - Head Edge", True 
+                        else:                           return f"{name} - Corner", True
+                        
+                    # If it's just a monitor, return the name
                     return name, True
                     
-        # 5. Fallback
+        # 4. Fallback: Inside the room, but not in a predefined zone
         return "Floor / Transit", True
 
     def process_frame(self, fft_1d_data):
@@ -566,6 +608,8 @@ class ActivityPipeline:
         # Step 1: Hardware Correction & Background
         # ==========================================
         self.frame_count += 1
+        is_jump = False
+        fall_confidence = 0.0
         corrected_data = np.copy(fft_1d_data)
         corrected_data[:, [0, 2, 4, 6]] *= -1 
 
@@ -629,6 +673,7 @@ class ActivityPipeline:
         final_peak_bin = None
 
         valid_candidates = []
+        raw_x, raw_y, raw_z = 0, 0, 0
         
         for cand_bin in sorted_peaks:
             # 1. Quick Spatial Check for this specific peak
@@ -644,6 +689,9 @@ class ActivityPipeline:
             az_cand = np.arcsin(np.clip(om_az / np.pi, -1.0, 1.0))
             el_cand = np.arcsin(np.clip(om_el / np.pi, -1.0, 1.0))
 
+            self.output_dict["azimuth"] = az_cand
+            self.output_dict["elevation"] = el_cand
+
             # 2. Project this candidate to World Coordinates
             Pr_c = np.array([cand_range * np.sin(az_cand) * np.cos(el_cand),
                             cand_range * np.cos(az_cand) * np.cos(el_cand),
@@ -652,8 +700,9 @@ class ActivityPipeline:
             
             # 3. TEST: Is this candidate actually in the room?
             zone_name, is_valid = self.evaluate_spatial_zone(Pb_c[0], Pb_c[1], Pb_c[2])
-            
             if is_valid and zone_name != "Out of Bounds (Ghost)":
+
+                cand_micro_state = "STABLE"
 
                 # --- VITAL CONTENT GATING ---
                 vital_multiplier = 0.1
@@ -661,68 +710,82 @@ class ActivityPipeline:
                     cand_history = self.spectral_history[cand_bin, :]
                     cand_history_safe = np.where(cand_history == 0, 1e-10 + 1e-10j, cand_history)
                     
-                    # 1. Extract and Unwrap
+                    # 1. Extract and Unwrap Phase
                     cand_phase = np.unwrap(np.angle(cand_history_safe))
-                    phase_ptp = np.ptp(cand_phase) # Peak-to-peak phase shift
                     
-                    # 2. Detrend to remove slow posture shifts (DC drift)
-                    detrended_phase = signal.detrend(cand_phase)
+                    # 2. Calculate Physical Displacement
+                    # At 60GHz, lambda = 5mm. Displacement = (phase_shift * lambda) / (4 * pi)
+                    phase_ptp = np.ptp(cand_phase)
+                    displacement_mm = (phase_ptp * 5.0) / (4.0 * np.pi)
                     
-                    # 3. Apply a Hanning window to prevent edge-effect noise in the FFT
-                    window = np.hanning(self.spectral_frames)
-                    windowed_phase = detrended_phase * window
+                    # 3. Calculate Phase Variance (First Derivative)
+                    # High variance catches jerky, non-sinusoidal micro-motions (typing, fidgeting)
+                    phase_diff = np.diff(cand_phase)
+                    phase_var = np.var(phase_diff)
+                    # print(f'Cand {cand_bin}: phase_var={phase_var:.2f}')
                     
-                    # 4. Perform the Slow-Time FFT
-                    # rfft is highly optimized for purely real input arrays
-                    fft_result = np.fft.rfft(windowed_phase)
-                    fft_mag = np.abs(fft_result)
+                    # --- MOTION EVALUATION GATES ---
                     
-                    # Calculate the frequency corresponding to each FFT bin
-                    freqs = np.fft.rfftfreq(self.spectral_frames, d=(1.0/FRAME_RATE))
-                    
-                    # 5. Define the Biological Breathing Band
-                    vital_band_mask = (freqs >= 0.15) & (freqs <= 0.5)
-                    noise_band_mask = (freqs > 1.0) & (freqs <= 3.0) # High freq noise
-                    
-                    # Calculate energy inside the breathing band vs the noise floor
-                    vital_energy = np.sum(fft_mag[vital_band_mask])
-                    noise_energy = np.sum(fft_mag[noise_band_mask])
-                    
-                    # Find the peak frequency inside the vital band
-                    if vital_energy > 0:
-                        vital_bins = np.where(vital_band_mask)[0]
-                        peak_bin = vital_bins[np.argmax(fft_mag[vital_band_mask])]
-                        breathing_rate_hz = freqs[peak_bin]
-                        
-                        # Calculate Signal-to-Noise Ratio (SNR) for the breathing signal
-                        # Add tiny epsilon to prevent divide by zero
-                        vital_snr = vital_energy / (noise_energy + 1e-6) 
-                        print(f'\n\ncand_bin: {cand_bin} - zone: {zone_name} - vital_snr: {vital_snr} - breathing_rate_hz: {breathing_rate_hz}')
-                        if vital_snr > 1.0: 
-                            vital_multiplier = 1.0  # Clean breathing confirmed
-                            print(f'Candidate {cand_bin} in {zone_name} has clean breathing signal')
-                        elif vital_snr > 0.6:
-                            # Some rhythm is present, but noisy.
-                            vital_multiplier = 0.5  
-                            print(f'Candidate {cand_bin} in {zone_name} has active motion')
-                        elif phase_ptp > 10.0:
-                            # FFT logic fails on major motion (high phase noise floor).
-                            # Fall back to time-domain logic: they are clearly active.
-                            vital_multiplier = 0.9  # They are moving too much for a clean FFT, but clearly active
-                            print(f'Candidate {cand_bin} in {zone_name} has active motion')
-                        else:
-                            vital_multiplier = 0.1  # Just static noise
-                            print(f'Candidate {cand_bin} in {zone_name} is static')
+                    # GATE A: MACRO-MOTION (Postural Shifts)
+                    if displacement_mm > 15.0:
+                        # They moved more than 15mm. The phase is too tangled for a clean vital FFT.
+                        # They are clearly active, so reward the candidate, but skip the spectrum math.
+                        vital_multiplier = 0.9 
+                        # print(f'Cand {cand_bin}: MACRO-MOTION ({displacement_mm:.1f}mm)')
+                        cand_micro_state = "MACRO_PHASE"
+
+                    # GATE B: MICRO-MOTION (Fidgeting / Talking)
+                    elif phase_var > 0.3: 
+                        # The overall displacement is small, but it's erratic. 
+                        # 0.25 rad^2 is a tunable threshold for "jagged" movement.
+                        vital_multiplier = 0.7
+                        # print(f'Cand {cand_bin}: MICRO-MOTION (var={phase_var:.2f})')
+                        cand_micro_state = "MICRO_PHASE"
+
+                    # GATE C: STILLNESS (Evaluate Vitals)
                     else:
-                        vital_multiplier = 0.05 # Dead space
-                        print(f'Candidate {cand_bin} in {zone_name} is dead space')
+                        # The target is still enough to extract a clean breathing rhythm.
+                        detrended_phase = signal.detrend(cand_phase)
+                        window = np.hanning(self.spectral_frames)
+                        windowed_phase = detrended_phase * window
+                        
+                        # Slow-Time FFT
+                        fft_result = np.fft.rfft(windowed_phase)
+                        fft_mag = np.abs(fft_result)
+                        freqs = np.fft.rfftfreq(self.spectral_frames, d=(1.0/FRAME_RATE))
+                        
+                        # Define Biological Bands
+                        # Expanded to 0.7 Hz (42 BPM) to catch heavy/distress breathing
+                        vital_band_mask = (freqs >= 0.15) & (freqs <= 0.7)
+                        
+                        # Total dynamic spectrum (ignoring DC/VLF baseline wander below 0.15Hz)
+                        eval_band_mask = (freqs >= 0.15) & (freqs <= 3.0) 
+                        
+                        vital_energy = np.sum(fft_mag[vital_band_mask])
+                        total_energy = np.sum(fft_mag[eval_band_mask])
+                        
+                        # Signal Quality Index (SQI): Ratio of vital energy to total energy
+                        sqi = vital_energy / (total_energy + 1e-6)
+                        
+                        if sqi > 0.45:
+                            vital_multiplier = 1.0  # Clean, dominant breathing rhythm
+                            # peak_bin = np.where(vital_band_mask)[0][np.argmax(fft_mag[vital_band_mask])]
+                            # breathing_rate_hz = freqs[peak_bin]
+                        elif sqi > 0.25:
+                            vital_multiplier = 0.5  # Weak breathing, or buried in slight noise
+                        else:
+                            vital_multiplier = 0.05 # Dead space (just static clutter noise)
+                            cand_micro_state = "DEAD_SPACE"
                 
                 valid_candidates.append({
                     'bin': cand_bin,
                     'x': Pb_c[0], 'y': Pb_c[1], 'z': Pb_c[2],
+                    'azimuth': az,
+                    'elevation': el,
                     'mag': dynamic_mag_profile[cand_bin],
                     'zone': zone_name,
-                    'vital_mult': vital_multiplier
+                    'vital_mult': vital_multiplier,
+                    'micro_state': cand_micro_state
                 })
                 
         # --- CANDIDATE SCORING ---
@@ -731,25 +794,29 @@ class ActivityPipeline:
             max_mag = max(c['mag'] for c in valid_candidates)
 
             #  Normal scoring (with tethering)
-            best_cand, best_score = self._score_candidates(valid_candidates, max_mag, use_tethering=True)
+            best_cand, best_score = self._score_candidates(valid_candidates, max_mag, use_tethering=False)
             
-            # Periodic reassessment: score WITHOUT tethering every N frames
-            self.frames_since_reassess += 1
-            if self.track_x is not None and self.frames_since_reassess >= self.reassess_interval:
-                self.frames_since_reassess = 0
-                untethered_best, untethered_score = self._score_candidates(valid_candidates, max_mag, use_tethering=False)
+            # # Periodic reassessment: score WITHOUT tethering every N frames
+            # self.frames_since_reassess += 1
+            # if self.track_x is not None and self.frames_since_reassess >= self.reassess_interval:
+            #     self.frames_since_reassess = 0
+            #     untethered_best, untethered_score = self._score_candidates(valid_candidates, max_mag, use_tethering=False)
                 
-                # If the untethered winner is significantly better, switch to it
-                if untethered_best['bin'] != best_cand['bin'] and untethered_score > best_score + 0.2:
-                    best_cand = untethered_best
+            #     # If the untethered winner is significantly better, switch to it
+            #     if untethered_best['bin'] != best_cand['bin'] and untethered_score > best_score + 0.2:
+            #         best_cand = untethered_best
                     
-                    # Reset track so the smoothing starts fresh on the new target
-                    self.track_x, self.track_y, self.track_z = None, None, None
-                    self.coord_buffer.clear()
-                    self.track_confidence = 0
+            #         # Reset track so the smoothing starts fresh on the new target
+            #         self.track_x, self.track_y, self.track_z = None, None, None
+            #         self.coord_buffer.clear()
+            #         self.track_confidence = 0
 
             final_peak_bin = best_cand['bin']
             self.current_active_zone = best_cand['zone']
+
+            # Extract the winning micro-motion state
+            self.current_micro_state = best_cand.get('micro_state', 'STABLE')
+
             raw_x, raw_y, raw_z = best_cand['x'], best_cand['y'], best_cand['z']
             raw_z = np.clip(raw_z, 0.05, 1.8)
 
@@ -758,10 +825,11 @@ class ActivityPipeline:
             # reject it — let the state machine handle exit via apnea at old location
             if self.track_x is not None:
                 jump_dist = np.sqrt((raw_x - self.track_x)**2 + (raw_y - self.track_y)**2)
-                if jump_dist > 1.0:  # More than 1 meter jump
+                if jump_dist > 1.5:  # More than 1.5 meter jump
                     # Don't accept this candidate — fall through to apnea path
                     is_valid_point = False
                     final_peak_bin = None
+                    is_jump = True
                         
         # Fallback: If no candidate is in the room, default to the loudest 
         # (This allows Step 3/4 to handle the 'Empty Room' logic)
@@ -770,53 +838,79 @@ class ActivityPipeline:
         else:
             dynamic_peak_bin = final_peak_bin
 
+        self.output_dict["Azimuth"] = best_cand['azimuth']
+        self.output_dict["Elevation"] = best_cand['elevation']
         self.output_dict["Range"] = dynamic_peak_bin * self.range_res
  
         # ==========================================
         # Step 3: State Machine
-        # ==========================================       
-        # 1. Check if the peak we found in Step 2 is strong enough to be "Active"
-        print(f"[Threshold] dynamic_mag={dynamic_mag_profile[dynamic_peak_bin]:.1f}, threshold={self.detection_threshold}")
-        if dynamic_mag_profile[dynamic_peak_bin] >= self.detection_threshold:
+        # ==========================================     
+        ## 1. Determine the detection threshold with HYSTERESIS
+        current_threshold = self.detection_threshold if not self.is_occupied else (self.detection_threshold * 0.75)  
+        print(f"[Threshold] dynamic_mag={dynamic_mag_profile[dynamic_peak_bin]:.1f}, threshold={current_threshold}")
+        
+        # 2. Check if the peak we found in Step 2 is strong enough to be "Active"
+        if not is_jump and dynamic_mag_profile[dynamic_peak_bin] >= self.detection_threshold:  # current_threshold:
+            # --- THE ENTRY DEBOUNCE FILTER ---
+            if not self.is_occupied:
+                self.entry_frames += 1
+                if self.entry_frames < self.frames_to_occupy:
+                    return self.output_dict # Abort early, don't update coordinates yet
+            
             # STATE 1: ACTIVE / BREATHING
             self.is_occupied = True
-            self.last_target_bin = dynamic_peak_bin         
+            self.apnea_frames = 0
+            self.last_target_bin = dynamic_peak_bin   
+            self.last_target_coords = (raw_x, raw_y, raw_z)      
             status = "Occupied (Breathing/Moving)"     
         
-        # 2. If the signal is weak, check if someone was PREVIOUSLY there (Stillness/Apnea)
+        # 3. If weak signal, check for Stillness (ONLY if previously occupied)
         elif self.is_occupied and self.last_target_bin is not None:
+            # Check the last known zone
+            if self.track_x is not None:
+                curr_loc = (self.track_x, self.track_y, self.track_z)
+            else:
+                # Use the coordinates saved when we first saw them
+                curr_loc = getattr(self, 'last_target_coords', (0,0,0))
+                
+            last_zone_name, _ = self.evaluate_spatial_zone(curr_loc[0], curr_loc[1], curr_loc[2])
+            
+            # --- ZONE GATING ---
+            # Only perform Apnea check in monitored zones (Bed, Chair, etc)
+            try:
+                is_monitored_zone = LAYOUT[last_zone_name]["type"] == "monitor"
+            except KeyError:
+                is_monitored_zone = False
+
             # Look at the raw power at the specific distance we last saw the user
-            current_raw_reflection = raw_mag_profile[self.last_target_bin]
+            current_raw_reflection = np.max(raw_mag_profile[self.last_target_bin - 1 : self.last_target_bin + 2])
             empty_bed_reflection = self.baseline_profile[self.last_target_bin]
             
             # If the reflection is still 'thicker' than an empty bed, they haven't left
-            print(f"[Apnea Check] raw={current_raw_reflection:.1f}, baseline={empty_bed_reflection:.1f}, margin={self.static_margin}, diff={current_raw_reflection - empty_bed_reflection:.1f}")
-            if current_raw_reflection > (empty_bed_reflection + self.static_margin):
-                # STATE 2: APNEA (Use safely buffered coordinates)
-                if self.track_x is not None:
-                    raw_x, raw_y, raw_z = self.track_x, self.track_y, self.track_z
-                elif len(self.coord_buffer) > 0:
-                    raw_x, raw_y, raw_z = self.coord_buffer[-1]
+            # print(f"[Apnea Check] raw={current_raw_reflection:.1f}, baseline={empty_bed_reflection:.1f}, margin={self.static_margin}, diff={current_raw_reflection - empty_bed_reflection:.1f}")
+            if is_monitored_zone and current_raw_reflection > (empty_bed_reflection + self.static_margin):
+                # S STATE 2: STILLNESS / MONITORING
+                self.apnea_frames += 1
+                
+                apnea_limit = FRAME_RATE * 5 # 5 seconds
+                if self.apnea_frames >= apnea_limit:
+                    status = "Possible Apnea"
                 else:
-                    # No track data at all — can't maintain apnea state
-                    self.is_occupied = False
-                    self.last_target_bin = None
-                    self.empty_room()
-                    return self.output_dict
-
-                status = "Still / Possible Apnea"
+                    status = "Still / Monitoring..."
             else:
-                # STATE 3: CONFIRMED EXIT (Power dropped to baseline)
+                # STATE 3: CONFIRMED EXIT 
                 self.is_occupied = False
+                self.apnea_frames = 0
                 self.last_target_bin = None
                 self.track_confidence = 0
                 self.coord_buffer.clear()
-                self.z_history.clear() # Clear Z-history on exit
+                self.z_history.clear()
                 self.track_x, self.track_y, self.track_z = None, None, None
                 self.empty_room()
-
-                # Force baseline to re-learn the truly empty room
-                self.baseline_profile = raw_mag_profile.copy()  # Snapshot the empty state
+                
+                # Instantly absorb the exit disturbances into the clutter map
+                # This mathematically silences the room until a real person walks back in.
+                self.clutter_map = corrected_data.copy()
                 
                 return self.output_dict
         else:
@@ -824,18 +918,8 @@ class ActivityPipeline:
             self.empty_room()
             return self.output_dict
 
-        # # ==========================================
-        # # Step 4: Outlier Rejection (Movement Logic)
-        # # ==========================================        
-        # # 1. TELEPORTATION CHECK
-        # # If the dot jumps more than 1.5 meters in 1/10th of a second, it's a glitch.
-        # if is_valid_point and self.track_x is not None and "Apnea" not in status:
-        #     jump_distance = np.sqrt((raw_x - self.track_x)**2 + (raw_y - self.track_y)**2)
-        #     if jump_distance > 1.5:  
-        #         is_valid_point = False 
-
         # ==========================================
-        # Step 5: Temporal Persistence (Hit/Miss)
+        # Step 4: Temporal Persistence (Hit/Miss)
         # ==========================================
         if is_valid_point:
             self.track_confidence = min(self.track_confidence + 1, self.confidence_threshold)
@@ -856,7 +940,7 @@ class ActivityPipeline:
                 return self.output_dict
 
         # ==========================================
-        # Step 6: Adaptive Smoothing & Actigraphy
+        # Step 5: Adaptive Smoothing & Actigraphy
         # ==========================================
         if self.track_confidence >= self.confidence_threshold:
             recent_coords = np.array(self.coord_buffer)
@@ -895,13 +979,20 @@ class ActivityPipeline:
 
             # --- Z-History Update for Fall Detection ---
             self.z_history.append(Z_b)
-            if len(self.z_history) > self.z_history_size:
+            if len(self.z_history) > self.z_history_size:  # Still stores 50 frames (2 seconds)
                 self.z_history.pop(0)
                 
-            # Calculate Vertical Velocity (V_z) in m/s (Assuming ~50ms per frame)
-            dt = len(self.z_history) * 0.04 
-            if dt > 0:
-                v_z = (self.z_history[-1] - self.z_history[0]) / dt
+            # --- The Short-Window Derivative (Velocity) ---  # TODO: Need to further work on this
+            # Calculate velocity over the last 0.4 seconds to catch the peak fall speed
+            # without diluting it over the full 2-second persistence buffer.
+            velocity_window_frames = int(FRAME_RATE * 0.4) # e.g., 10 frames at 25 FPS
+            
+            if len(self.z_history) >= velocity_window_frames:
+                # Compare current Z to the Z from 0.4 seconds ago
+                dz = self.z_history[-1] - self.z_history[-velocity_window_frames]
+                dt = velocity_window_frames * (1.0 / FRAME_RATE) 
+                v_z = dz / dt  # Vertical velocity in m/s (negative means falling)
+                # print(f"\nCurrent Z: {Z_b:.2f}m | Drop Speed: {v_z:.2f} m/s")
             else:
                 v_z = 0.0
         else:
@@ -909,24 +1000,23 @@ class ActivityPipeline:
             return self.output_dict
 
         # ==========================================
-        # Step 7: Posture Logic & Motion Tagging
+        # Step 6: Posture Logic & Motion Tagging
         # ==========================================
         # Re-evaluate the zone with the smoothed coordinates
         final_zone, _ = self.evaluate_spatial_zone(X_b, Y_b, Z_b)
 
-        # --- ZONE DEBOUNCING ---
-        # Don't switch the displayed zone until the new zone persists for N frames
-        if final_zone != self.current_stable_zone:
-            self.zone_history.append(final_zone)
-            # Check if the last N entries all agree on the new zone
-            if len(self.zone_history) >= self.frames_to_confirm_zone:
-                recent = self.zone_history[-self.frames_to_confirm_zone:]
-                if all(z == final_zone for z in recent):
-                    self.current_stable_zone = final_zone  # Confirmed switch
-            # Keep using the old stable zone until confirmed
-            final_zone = self.current_stable_zone
-        else:
-            self.zone_history.clear()  # Reset counter when back to stable zone
+        # --- ZONE DEBOUNCING (Majority Vote) ---
+        self.zone_history.append(final_zone)
+        if len(self.zone_history) > self.frames_to_confirm_zone:
+            self.zone_history.pop(0)
+
+        # Only update the UI if the buffer is full
+        if len(self.zone_history) == self.frames_to_confirm_zone:
+            # Find the most common zone in the recent history
+            most_common_zone = max(set(self.zone_history), key=self.zone_history.count)
+            self.current_stable_zone = most_common_zone
+            
+        final_zone = self.current_stable_zone
 
         # Posture Recognition logic
         if Z_b > STANDING_THRESHOLD:
@@ -936,19 +1026,31 @@ class ActivityPipeline:
         else:
             posture = "Lying Down"
 
-        # Motion Tagging logic
+        ### Unified Motion Tagging Hierarchy
         if "Apnea" in status:
             motion_str = "Static"
-        elif self.motion_level < REST_MAX: 
-            motion_str = "Resting/Breathing"
-        elif self.motion_level < RESTLESS_MAX: 
-            motion_str = "Restless/Shifting"
-        else:
+            
+        # 1. Look for massive spatial coordinate changes
+        elif self.motion_level > RESTLESS_MAX: 
             motion_str = "Major Movement"
+            
+        # 2. Look for large in-place phase displacements (rolling over in bed)
+        elif getattr(self, 'current_micro_state', 'STABLE') == "MACRO_PHASE" and ("Bed" in self.current_active_zone or "Chair" in self.current_active_zone):
+            motion_str = "Postural Shift"
+
+        # 3. Look for moderate spatial drift
+        elif self.motion_level > REST_MAX: 
+            motion_str = "Restless/Shifting"
+            
+        # 4. Look for sub-millimeter phase chaos (typing, talking, twitching)
+        elif getattr(self, 'current_micro_state', 'STABLE') == "MICRO_PHASE":
+            motion_str = "Restless/Fidgeting"
+            
+        # 5. Signal is clean and coordinates are locked. Safe to read vitals.
+        else:
+            motion_str = "Resting/Breathing"
         
         # Contextual Overrides
-        fall_confidence = 0.0
-        
         if final_zone in ["Out of Bounds (Ghost)", "Ignored"]:
             # The math tried to drag the dot outside the wall. Instantly kill the track.
             self.is_occupied = False
@@ -960,36 +1062,36 @@ class ActivityPipeline:
             status = status.replace("Occupied", "In the Room") 
             
             # FALL DETECTION GATE
-            if Z_b <= self.fall_threshold_z:
+            if Z_b <= self.fall_threshold_z or self.is_fallen:
                 # If they dropped fast OR they were already flagged as fallen
-                print(f'Height: {Z_b}, Zone: {zone_name}, Velocity: {v_z}')
-                if v_z <= self.fall_velocity_threshold or self.is_fallen:
-                    self.is_fallen = True
-                    self.fall_persistence_frames += 1
-                    
-                    # 1. Height Score (Closer to floor = worse)
-                    h_score = max(0.0, (self.fall_threshold_z - Z_b) / self.fall_threshold_z) * 100.0
-                    # 2. Time Score (Longer on floor = worse)
-                    p_score = min(100.0, (self.fall_persistence_frames / 50.0) * 100.0) # 50 frames = 2 secs
-                    
-                    fall_confidence = (0.4 * h_score) + (0.6 * p_score)
-                    
-                    if fall_confidence > 60.0:
-                        status = "CRITICAL: Fall Detected!"
-                        posture = "Fallen"
-                else:
-                    # They are low, but lowered slowly (e.g., sitting on the floor to play)
-                    self.fall_persistence_frames = max(0, self.fall_persistence_frames - 1)
+                # if v_z <= self.fall_velocity_threshold or self.is_fallen:
+                self.is_fallen = True
+                self.fall_persistence_frames += 1
+                
+                # 1. Height Score (Closer to floor = worse)
+                h_score = max(0.0, (self.fall_threshold_z - Z_b) / self.fall_threshold_z) * 100.0
+                
+                # 2. Time Score (Longer on floor = worse) 
+                # They must stay down for the full 2 seconds (50 frames) to hit 100%
+                p_score = min(100.0, (self.fall_persistence_frames / self.z_history_size) * 100.0) 
+                
+                fall_confidence = (0.4 * h_score) + (0.6 * p_score)
+                
+                # Require high confidence (meaning they fell fast AND stayed down)
+                if fall_confidence > 60.0:
+                    status = "CRITICAL: Fall Detected!"
+                    posture = "Fallen"
             else:
-                self.is_fallen = False
-                self.fall_persistence_frames = 0
+                # They are low, but lowered slowly (e.g., sitting on the floor safely)
+                # Slowly decrement the persistence so it doesn't instantly clear
+                self.fall_persistence_frames = max(0, self.fall_persistence_frames - 2)
         else:
-            # They are safe in a bed or chair. Reset fall logic.
+            # They are back up (above 40cm). Reset fall logic.
             self.is_fallen = False
             self.fall_persistence_frames = 0
             
         # ==========================================
-        # Step 8: Confidence Index Generation
+        # Step 7: Confidence Index Generation
         # ==========================================
         # Occupancy Confidence
         temporal_conf = (self.track_confidence / self.confidence_threshold) * 100.0
@@ -1023,15 +1125,16 @@ class ActivityPipeline:
         posture_confidence = max(50.0, base_posture_conf - motion_penalty)
 
         # ==========================================
-        # Step 9: Zone Timer Update
+        # Step 8: Zone Timer Update
         # ==========================================
-        now = time.monotonic()
+        now = self.frame_count / FRAME_RATE
         self._update_zone_timer(final_zone, is_valid_point, now)
 
         duration_str = "--"
         if self.zone_timer_zone is not None and self.zone_timer_start is not None:
             duration_str = self._format_duration(now - self.zone_timer_start)
 
+        # Output
         self.output_dict = {
             "X": X_b,
             "Y": Y_b,
@@ -1039,6 +1142,7 @@ class ActivityPipeline:
             "Range": self.output_dict["Range"],
             "Azimuth": self.output_dict["Azimuth"],
             "Elevation": self.output_dict["Elevation"],
+            "final_bin": dynamic_peak_bin,
             "zone": final_zone,
             "status": status,
             "occ_confidence": occ_confidence,
@@ -1047,22 +1151,24 @@ class ActivityPipeline:
             "motion_str": motion_str,
             "duration_str": duration_str,
             "fall_confidence": fall_confidence,
+            "spectral_history": self.spectral_history,
         }
         return self.output_dict
-
 
 # ==========================================
 # 3. GUI Visualizer (dashboard)
 # ==========================================
-class ActivityVisualizer:
+class Visualizer:
     """
     Dashboard-style visualizer for room occupancy / posture / motion monitoring.
     Keeps the same update(...) interface as your current class.
     """
 
-    def __init__(self, pipeline, history_len=120):
-        self.p = pipeline
-        self.history_len = history_len
+    def __init__(self, act_pipeline, resp_pipeline=None, history_len=None):
+        self.p = act_pipeline
+        self.resp_pipeline = resp_pipeline
+        self.resp_window_sec = RESP_WINDOW_SEC if 'RESP_WINDOW_SEC' in globals() else 30
+        self.history_len = history_len if history_len is not None else int(self.resp_window_sec * FRAME_RATE)
 
         # -----------------------------
         # Theme
@@ -1094,42 +1200,38 @@ class ActivityVisualizer:
         # -----------------------------
         # Figure layout
         # -----------------------------
-        self.fig = plt.figure(figsize=(13, 8.4), facecolor=self.FIG_BG)
+        self.fig = plt.figure(figsize=(15.5, 8.4), facecolor=self.FIG_BG)
 
-        # Main layout: top content + bottom cards
+        # Main layout: Left (Cards) | Middle (Room Map) | Right (Plots)
         outer = self.fig.add_gridspec(
-            2, 1,
-            height_ratios=[3.0, 1.05],
+            1, 3,
+            width_ratios=[0.55, 1.0, 1.20],
+            wspace=0.25
+        )
+
+        # Left layout: Vertically stacked cards
+        left_gs = outer[0].subgridspec(
+            3, 1,
             hspace=0.25
         )
+        self.ax_occ = self.fig.add_subplot(left_gs[0])
+        self.ax_posture = self.fig.add_subplot(left_gs[1])
+        self.ax_system = self.fig.add_subplot(left_gs[2])
 
-        # Top layout:
-        # room map | small spacer | right-side stacked plots
-        top = outer[0].subgridspec(
-            2, 3,
-            width_ratios=[0.86, 0.2, 1],
-            height_ratios=[0.84, 1.16],
-            wspace=0.00,
-            hspace=0.3
+        # Middle layout: Room Map
+        self.ax = self.fig.add_subplot(outer[1])
+
+        # Right layout: Vertically stacked plots
+        right_gs = outer[2].subgridspec(
+            3, 1,
+            height_ratios=[1.5, 0.8, 1.2],
+            hspace=0.35
         )
+        self.ax_live_resp = self.fig.add_subplot(right_gs[0])  # live breathing signal
+        self.ax_rr_trend = self.fig.add_subplot(right_gs[1], sharex=self.ax_live_resp)   # RR trend
+        self.ax_trend = self.fig.add_subplot(right_gs[2])   # combined trends
 
-        self.ax = self.fig.add_subplot(top[:, 0])         # room map
-        # top[:, 1] intentionally left empty as spacer
-        self.ax_breath = self.fig.add_subplot(top[0, 2])  # breathing reserved
-        self.ax_trend = self.fig.add_subplot(top[1, 2])   # combined trends
-
-        # Bottom layout: centered narrower cards
-        bottom = outer[1].subgridspec(
-            1, 5,
-            width_ratios=[0.22, 1.0, 1.0, 1.0, 0.22],
-            wspace=0.14
-        )
-
-        self.ax_occ = self.fig.add_subplot(bottom[0, 1])
-        self.ax_posture = self.fig.add_subplot(bottom[0, 2])
-        self.ax_system = self.fig.add_subplot(bottom[0, 3])
-
-        self.fig.subplots_adjust(left=0.06, right=0.96, top=0.90, bottom=0.08)
+        self.fig.subplots_adjust(left=0.03, right=0.97, top=0.92, bottom=0.06)
 
         # -----------------------------
         # Main room panel styling
@@ -1169,7 +1271,6 @@ class ActivityVisualizer:
         # Trend panel styling
         # -----------------------------
         for trend_ax, title in [
-                (self.ax_breath, "Confidence Trends"),
                 (self.ax_trend, "Motion / Activity")
             ]:
                 trend_ax.set_facecolor(self.PANEL_BG)
@@ -1178,7 +1279,7 @@ class ActivityVisualizer:
         trend_ax.tick_params(colors=self.SUBTEXT, labelsize=9)
         trend_ax.grid(True, linestyle='--', linewidth=0.6, alpha=0.35, color=self.GRID)
         trend_ax.set_title(title, color=self.TEXT, fontsize=12, pad=10, fontweight="bold")
-        trend_ax.set_xlabel("Frames", color=self.TEXT, fontsize=10)
+        trend_ax.set_xlabel("Time (s)", color=self.TEXT, fontsize=10)
         trend_ax.set_ylabel("Normalized", color=self.TEXT, fontsize=10)
 
         # -----------------------------
@@ -1260,23 +1361,43 @@ class ActivityVisualizer:
             facecolor=self.CARD_BG
         )
 
-        self._style_reserved_axis(self.ax_breath, "Breathing Signal (Reserved)")
         self._style_trend_axis(self.ax_trend, "Confidence: Occupancy / Posture / Motion / Fall Trends", "Normalized")
 
-        self.ax_breath.text(
-            0.5, 0.60,
-            "Reserved for future breathing waveform",
-            transform=self.ax_breath.transAxes,
-            ha="center", va="center",
-            color=self.TEXT, fontsize=11, fontweight="bold"
+        self.resp_window_sec = RESP_WINDOW_SEC if 'RESP_WINDOW_SEC' in globals() else 30
+        self.time_axis_seconds = np.linspace(-self.resp_window_sec, 0, self.resp_window_sec * FRAME_RATE)
+
+        self.line_resp, = self.ax_live_resp.plot(self.time_axis_seconds, np.zeros_like(self.time_axis_seconds), color=self.OCCUPANT, linewidth=1.5)
+        self.line_rr, = self.ax_rr_trend.plot(self.time_axis_seconds, np.zeros_like(self.time_axis_seconds), color=self.TEXT, linewidth=1.5)
+
+        self.scatter_inhale = self.ax_live_resp.scatter([], [], color='green', marker='^', zorder=5)
+        self.scatter_exhale = self.ax_live_resp.scatter([], [], color='red', marker='v', zorder=5)
+
+        self.apnea_fill = None
+
+        self.apnea_text_ui = self.ax_live_resp.text(
+            0.02, 0.92, "Breathing: Unknown", 
+            transform=self.ax_live_resp.transAxes, 
+            color=self.TEXT, fontsize=11, fontweight="bold", va="top"
         )
-        self.ax_breath.text(
-            0.5, 0.38,
-            "Respiration signal / RR / breathing confidence",
-            transform=self.ax_breath.transAxes,
-            ha="center", va="center",
-            color=self.SUBTEXT, fontsize=10
+        self.cycle_text_ui = self.ax_rr_trend.text(
+            0.02, 0.85, "RR: 0.0", 
+            transform=self.ax_rr_trend.transAxes, 
+            color=self.SUBTEXT, fontsize=10, fontweight="bold", va="top"
         )
+        
+        for base_ax, title in [(self.ax_live_resp, "Live Breathing Signal"), (self.ax_rr_trend, "Respiration Rate")]:
+            base_ax.set_facecolor(self.PANEL_BG)
+            for spine in base_ax.spines.values(): spine.set_color("#475569")
+            base_ax.tick_params(colors=self.SUBTEXT, labelsize=9)
+            base_ax.grid(True, linestyle='--', linewidth=0.55, alpha=0.28, color=self.GRID)
+            if title: base_ax.set_title(title, color=self.TEXT, fontsize=11, fontweight="bold", pad=5)
+            
+        self.ax_live_resp.set_xlim(-self.resp_window_sec, 0)
+        self.ax_rr_trend.set_xlim(-self.resp_window_sec, 0)
+        self.ax_live_resp.set_ylim(-3.14, 3.14) 
+        self.ax_rr_trend.set_ylim(0, 40) 
+        
+        plt.setp(self.ax_live_resp.get_xticklabels(), visible=False)
 
     # =========================================================
     # Helpers
@@ -1311,14 +1432,14 @@ class ActivityVisualizer:
         )
         ax.add_patch(card)
 
-        ax.text(0.08, 0.84, title, fontsize=15, fontweight="bold",
+        ax.text(0.04, 0.84, title, fontsize=12, fontweight="bold",
         color=self.TEXT, va="center", ha="left", clip_on=False)
 
         row_y = [0.66, 0.48, 0.30, 0.14]
         for (label, value), y in zip(lines, row_y):
-            ax.text(0.08, y, str(label), fontsize=10, color=self.SUBTEXT,
+            ax.text(0.04, y, str(label), fontsize=9, color=self.SUBTEXT,
                     va="center", ha="left", clip_on=False)
-            ax.text(0.91, y, str(value), fontsize=11, color=self.TEXT,
+            ax.text(0.96, y, str(value), fontsize=9, color=self.TEXT,
                     va="center", ha="right", fontweight="bold", clip_on=False)
 
     def _zone_color(self, zone_type):
@@ -1539,14 +1660,19 @@ class ActivityVisualizer:
                     break
 
     def _update_trends(self):
-        x = np.arange(len(self.occ_hist))
+        curr_len = len(self.occ_hist)
+        if curr_len == 0:
+            return
+            
+        elapsed_sec = curr_len / float(FRAME_RATE)
+        x = np.linspace(-elapsed_sec, 0, curr_len)
 
         self.occ_line.set_data(x, list(self.occ_hist))
         self.posture_line.set_data(x, list(self.posture_hist))
         self.motion_smooth_line.set_data(x, list(self.motion_smooth_hist))
         self.fall_line.set_data(x, list(self.fall_hist))
 
-        self.ax_trend.set_xlim(0, max(self.history_len - 1, 20))
+        self.ax_trend.set_xlim(-self.resp_window_sec, 0)
         self.ax_trend.set_ylim(0, 1.05)
         self.ax_trend.margins(x=0.02)
 
@@ -1581,46 +1707,7 @@ class ActivityVisualizer:
         ax.set_yticks([])
         ax.set_title(title, color=self.TEXT, fontsize=12, pad=10, fontweight="bold")
 
-    def update_breath_panel(self, waveform=None, rr_bpm=None, breath_conf=None):
-        self.ax_breath.cla()
-        self._style_reserved_axis(self.ax_breath, "Breathing Signal")
 
-        if waveform is None or len(waveform) == 0:
-            self.ax_breath.text(
-                0.5, 0.60,
-                "Reserved for future breathing waveform",
-                transform=self.ax_breath.transAxes,
-                ha="center", va="center",
-                color=self.TEXT, fontsize=11, fontweight="bold"
-            )
-            self.ax_breath.text(
-                0.5, 0.38,
-                "Respiration signal / RR / breathing confidence",
-                transform=self.ax_breath.transAxes,
-                ha="center", va="center",
-                color=self.SUBTEXT, fontsize=10
-            )
-            return
-
-        x = np.arange(len(waveform))
-        self.ax_breath.plot(x, waveform, linewidth=1.8)
-        self.ax_breath.set_xticks([])
-        self.ax_breath.set_yticks([])
-
-        if rr_bpm is not None:
-            self.ax_breath.text(
-                0.03, 0.92,
-                f"RR: {rr_bpm:.1f} bpm",
-                transform=self.ax_breath.transAxes,
-                color=self.TEXT, fontsize=10, fontweight="bold", va="top"
-            )
-        if breath_conf is not None:
-            self.ax_breath.text(
-                0.97, 0.92,
-                f"Conf: {breath_conf:.0f}%",
-                transform=self.ax_breath.transAxes,
-                color=self.TEXT, fontsize=10, fontweight="bold", ha="right", va="top"
-            )
 
     def _fall_status(self, fall_confidence):
         fc = 0.0 if fall_confidence is None else float(fall_confidence)
@@ -1635,7 +1722,7 @@ class ActivityVisualizer:
     # =========================================================
     # Main update
     # =========================================================
-    def update(self, occ_out_dict):
+    def update(self, occ_out_dict, resp_dict=None, frames=1):
         """
         Update dashboard using the same API as your current visualizer.
         """
@@ -1648,7 +1735,7 @@ class ActivityVisualizer:
         Y_b = occ_out_dict["Y"]
         Z_b = occ_out_dict["Z"]
         zone_name = occ_out_dict["zone"]
-        print(f"\n[Visualizer] zone_name: {zone_name}")
+        # print(f"\n[Visualizer] zone_name: {zone_name}")
         state_name = occ_out_dict["status"]
         occ_confidence = occ_out_dict["occ_confidence"]
         posture_confidence = occ_out_dict["posture_confidence"]
@@ -1657,7 +1744,7 @@ class ActivityVisualizer:
         duration_str = occ_out_dict["duration_str"]
         fall_confidence = occ_out_dict["fall_confidence"]
         Range = occ_out_dict["Range"]
-        print(f"[Visualizer] Range: {Range}")
+        # print(f"[Visualizer] Range: {Range}")
         Azimuth = occ_out_dict["Azimuth"]
         Elevation = occ_out_dict["Elevation"]
         
@@ -1689,12 +1776,13 @@ class ActivityVisualizer:
         else:
             motion_smooth = 0.85 * self.motion_smooth_hist[-1] + 0.15 * motion_value
 
-        self.motion_hist.append(motion_value)
-        self.motion_smooth_hist.append(motion_smooth)
-        self.occ_hist.append(occ_value)
-        self.posture_hist.append(posture_value)
-        self.fall_hist.append(fall_value)
-        self.activity_hist.append(activity_value)
+        for _ in range(frames):
+            self.motion_hist.append(motion_value)
+            self.motion_smooth_hist.append(motion_smooth)
+            self.occ_hist.append(occ_value)
+            self.posture_hist.append(posture_value)
+            self.fall_hist.append(fall_value)
+            self.activity_hist.append(activity_value)
 
         self._update_trends()
 
@@ -1754,9 +1842,265 @@ class ActivityVisualizer:
             facecolor=fall_card_color
         )
 
+        # Draw Respiratory Data if available
+        if resp_dict is not None and resp_dict.get("confidence", 0) > 0:
+            # 1. Update lines
+            self.line_resp.set_ydata(resp_dict["live_signal"])
+            self.line_rr.set_ydata(resp_dict["rr_history"])
+            
+            # 2. Update Scatters (Peaks)
+            inhales = resp_dict["inhales"]
+            exhales = resp_dict["exhales"]
+            if len(inhales) > 0:
+                self.scatter_inhale.set_offsets(np.c_[self.time_axis_seconds[inhales], resp_dict["live_signal"][inhales]])
+            else:
+                self.scatter_inhale.set_offsets(np.empty((0, 2)))
+                
+            if len(exhales) > 0:
+                self.scatter_exhale.set_offsets(np.c_[self.time_axis_seconds[exhales], resp_dict["live_signal"][exhales]])
+            else:
+                self.scatter_exhale.set_offsets(np.empty((0, 2)))
+                
+            # 3. Update Apnea Shading
+            if self.apnea_fill is not None:
+                self.apnea_fill.remove()
+                self.apnea_fill = None
+            
+            apnea_trace = resp_dict.get("apnea_trace", np.zeros_like(self.time_axis_seconds, dtype=bool))
+            if np.any(apnea_trace):
+                self.apnea_fill = self.ax_live_resp.fill_between(
+                    self.time_axis_seconds, -3.14, 3.14,
+                    where=apnea_trace,
+                    color=self.CARD_ALERT, alpha=0.25, zorder=1
+                )
+                
+            # 4. Update Text Overlays
+            status_text = "Apnea Warning" if resp_dict.get("apnea_active") else f"Monitoring ({int(resp_dict['confidence'])}%)"
+            self.apnea_text_ui.set_text(f"Breathing: {status_text} | Depth: {resp_dict.get('depth', 'unknown').title()}")
+            self.apnea_text_ui.set_color("#EF4444" if resp_dict.get("apnea_active") else self.TEXT)
+            
+            self.cycle_text_ui.set_text(f"RR: {resp_dict['rr_current']:.1f} bpm | Cycle: {resp_dict['cycle_duration']:.1f}s")
+        else:
+            # Clear or grey-out the plots if confidence is lost or no data
+            self.line_resp.set_ydata(np.zeros_like(self.time_axis_seconds))
+            self.line_rr.set_ydata(np.zeros_like(self.time_axis_seconds))
+            self.scatter_inhale.set_offsets(np.empty((0, 2)))
+            self.scatter_exhale.set_offsets(np.empty((0, 2)))
+            if self.apnea_fill is not None:
+                self.apnea_fill.remove()
+                self.apnea_fill = None
+            self.apnea_text_ui.set_text("Breathing: Waiting/Unstable...")
+            self.apnea_text_ui.set_color(self.SUBTEXT)
+            self.cycle_text_ui.set_text("RR: 0.0")
+
         # Draw refresh
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
+
+# ==========================================
+# 4. Respiratory Pipeline
+# ==========================================
+class RespiratoryPipeline:
+    def __init__(self, fps=25, window_seconds=30, baseline_seconds=40):
+        self.fps = fps
+        self.window_frames = int(window_seconds * self.fps)
+        self.baseline_frames = int(baseline_seconds * self.fps) # Baseline needs to be longer than the window
+        
+        # State & History Buffers
+        self.history_buffer = np.zeros(self.baseline_frames)
+        self.rr_history_buffer = np.zeros(self.window_frames) # Size RR history directly to match live window time domain
+        
+        # Apnea trace (True/False boolean array synced with live_signal frame-by-frame)
+        self.apnea_trace = np.zeros(self.window_frames, dtype=bool)
+
+        self.apnea_active = False
+        self.apnea_duration = 0.0
+        
+        self.current_rr = 0.0
+        self.cycle_duration = 0.0
+        self.depth_status = "unknown"
+        self.confidence = 0.0
+        self.locked_bin = None
+        self.frames_since_present = 0
+
+    def process(self, act_pipe_out_dict, frames=1):
+        """
+        act_pipe_out_dict: Output dictionary from ActivityPipeline containing bin and history
+        """
+        current_bin = act_pipe_out_dict['final_bin']
+        motion_str = act_pipe_out_dict['motion_str']
+        
+        # 1. Target Lock (Hysteresis)
+        # Only switch respiratory tracking bin if there was macro motion, or no lock exists
+        if self.locked_bin is None or motion_str == "MACRO_PHASE":
+            self.locked_bin = current_bin
+            
+        # 2. Multi-Bin Spatial Fusion
+        # Grab exactly 1 bin on each side of the locked bin to smoothly average spatial shifts
+        spectral_hist = act_pipe_out_dict['spectral_history']
+        start_bin = max(0, self.locked_bin - 1)
+        end_bin = min(spectral_hist.shape[0], self.locked_bin + 2)
+        
+        fused_complex = np.sum(spectral_hist[start_bin:end_bin, :], axis=0)
+
+        # 3. Phase unwrapping, detrending, and SQI calculation
+        raw_phase = np.unwrap(np.angle(fused_complex))
+        detrended_phase = signal.detrend(raw_phase)
+        
+        # Calculate Signal Quality Index (SQI)
+        window = np.hanning(len(detrended_phase))
+        fft_mag = np.abs(np.fft.rfft(detrended_phase * window))
+        freqs = np.fft.rfftfreq(len(detrended_phase), d=(1.0/self.fps))
+
+        breathing_mask = (freqs >= 0.15) & (freqs <= 0.5)
+        total_mask = (freqs >= 0.15) & (freqs <= 3.0)
+        
+        sqi = np.sum(fft_mag[breathing_mask]) / (np.sum(fft_mag[total_mask]) + 1e-6)
+
+        # 2. Confidence Metric Evaluation
+        if act_pipe_out_dict['motion_str'] == "MACRO_PHASE":
+            self.confidence = 0.0   # Total corruption during huge movement
+        elif act_pipe_out_dict['motion_str'] == "MICRO_PHASE":
+            self.confidence = min(30.0, sqi * 100) # Capped at 30% during fidgeting
+        else: # STABLE
+            self.confidence = min(100.0, sqi * 200) # e.g. SQI of 0.45 = 90% confidence
+            
+        # 3. Bandpass filtering for Live UI
+        b, a = signal.butter(2, [0.15, 0.5], btype='bandpass', fs=self.fps)
+        filtered_resp = signal.filtfilt(b, a, detrended_phase)
+        live_signal = filtered_resp[-self.window_frames:]
+        
+        # Mask out "ghost" phases before the subject physically sat down
+        self.frames_since_present += frames
+        if self.frames_since_present < self.window_frames:
+            live_signal[:-self.frames_since_present] = 0.0
+
+        # Update Long-term baseline history 
+        if self.confidence > 40.0:
+            self.history_buffer = np.roll(self.history_buffer, -len(filtered_resp))
+            self.history_buffer[-len(filtered_resp):] = filtered_resp
+
+        # 4. Scale-Invariant Apnea Detection
+        self.apnea_trace = np.roll(self.apnea_trace, -frames) # Shift the visual trace left by frames
+        self.apnea_trace[-frames:] = False
+
+        if act_pipe_out_dict['motion_str'] != "MACRO_PHASE":
+            recent_signal = self.history_buffer[-int(5 * self.fps):]
+            signal_mean_abs = np.mean(np.abs(recent_signal))
+            
+            if signal_mean_abs > 1e-6:
+                norm_var = np.var(recent_signal) / (signal_mean_abs ** 2)
+                norm_range = np.ptp(recent_signal) / signal_mean_abs
+                self.apnea_active = (norm_var < 0.05 and norm_range < 0.3)
+            else:
+                self.apnea_active = True
+
+            if self.apnea_active: self.apnea_duration += (frames / float(self.fps))
+            else: self.apnea_duration = 0.0
+        else:
+            self.apnea_active = False
+            self.apnea_duration = 0.0
+
+        # Mark the most recent frames in the UI visual trace
+        if self.apnea_active:
+            self.apnea_trace[-frames:] = True
+
+        # --- Peak Detection (Inhales = Troughs, Exhales = Peaks) ---
+        inhales = []
+        exhales = []
+        
+        if self.confidence > 20.0 and not self.apnea_active:
+            min_dist = max(1, int(self.fps * 0.5))
+            sig_range = np.ptp(live_signal)
+            prominence = max(0.05, sig_range * 0.25)
+            
+            exhales_arr, _ = signal.find_peaks(live_signal, distance=min_dist, prominence=prominence)
+            inhales_arr, _ = signal.find_peaks(-live_signal, distance=min_dist, prominence=prominence)
+            exhales = exhales_arr.tolist()
+            inhales = inhales_arr.tolist()
+            
+            # --- Respiration Rate (RR) & Cycle Duration ---
+            if len(inhales) >= 2:
+                # Cycle duration based on Inhale-to-Inhale times
+                intervals = np.diff(inhales) / self.fps
+                valid_intervals = intervals[(intervals > 0.5) & (intervals < 6.0)]
+                if len(valid_intervals) > 0:
+                    self.cycle_duration = np.median(valid_intervals)
+                    self.current_rr = 60.0 / self.cycle_duration
+                else:
+                    self.current_rr = 0.0
+            else:
+                self.current_rr = 0.0
+        else:
+            self.current_rr = 0.0
+
+        # --- Depth Classification ---
+        if self.confidence > 20.0 and not self.apnea_active:
+            baseline_mean = np.mean(self.history_buffer)
+            baseline_amplitude = np.mean(np.abs(self.history_buffer - baseline_mean))
+            
+            recent_mean = np.mean(live_signal)
+            recent_amplitude = np.mean(np.abs(live_signal - recent_mean))
+            
+            if baseline_amplitude > 1e-4:
+                amplitude_ratio = recent_amplitude / baseline_amplitude
+                if amplitude_ratio > 1.3:
+                    self.depth_status = "deep"
+                elif amplitude_ratio < 0.7:
+                    self.depth_status = "shallow"
+                else:
+                    self.depth_status = "normal"
+            else:
+                self.depth_status = "unknown"
+        elif self.apnea_active:
+            self.depth_status = "apnea"
+        else:
+            self.depth_status = "unknown"
+        
+        # Roll RR history for plot synced to the live_signal time axis
+        self.rr_history_buffer = np.roll(self.rr_history_buffer, -frames)
+        self.rr_history_buffer[-frames:] = self.current_rr
+
+        return {
+            "live_signal": live_signal,
+            "inhales": inhales,
+            "exhales": exhales,
+            "cycle_duration": self.cycle_duration,
+            "rr_current": self.current_rr,
+            "rr_history": self.rr_history_buffer, # Length = self.window_frames
+            "apnea_active": self.apnea_active,
+            "apnea_duration": self.apnea_duration,
+            "apnea_trace": self.apnea_trace, # Length = self.window_frames
+            "depth": self.depth_status,
+            "confidence": self.confidence,
+            "motion_status": act_pipe_out_dict['motion_str']
+        }
+        
+    def _reset_state(self):
+        self.apnea_active = False
+        self.apnea_duration = 0.0
+        self.apnea_trace = np.zeros(self.window_frames, dtype=bool)
+        self.rr_history_buffer = np.zeros(self.window_frames)
+        self.depth_status = "unknown"
+        self.confidence = 0.0
+        self.locked_bin = None
+        self.history_buffer = np.zeros(self.baseline_frames)
+        self.current_rr = 0.0
+        self.cycle_duration = 0.0
+        self.frames_since_present = 0
+        
+    def _get_empty_dict(self):
+        return {
+            "live_signal": np.zeros(self.window_frames),
+            "inhales": [], "exhales": [],
+            "rr_current": 0.0, 
+            "rr_history": np.zeros(self.window_frames),
+            "apnea_active": False, "apnea_duration": 0.0, 
+            "apnea_trace": np.zeros(self.window_frames, dtype=bool),
+            "cycle_duration": 0.0, "depth": "unknown",
+            "confidence": 0.0, "motion_status": "STABLE"
+        }
+
 
 # ==========================================
 # 5. Main Application Loop
@@ -1774,9 +2118,10 @@ if __name__ == "__main__":
     radar_process = RadarController(state_q=state_q, pt_fft_q=pt_fft_q)
     radar_process.start()
     
-    # 3. Initialize Pipeline and Visualizer
-    pipeline = ActivityPipeline(num_range_bins=RANGE_IDX_NUM, range_resolution=RANGE_RESOLUTION)
-    visualizer = ActivityVisualizer(pipeline)
+    # 3. Initialize Pipelines and Visualizer
+    act_pipeline = ActivityPipeline(num_range_bins=RANGE_IDX_NUM, range_resolution=RANGE_RESOLUTION)
+    resp_pipeline = RespiratoryPipeline(fps=FRAME_RATE, window_seconds=RESP_WINDOW_SEC)
+    visualizer = Visualizer(act_pipeline, resp_pipeline)
     last_notified_state = ""
     
     print("Waiting for radar data...")
@@ -1787,19 +2132,42 @@ if __name__ == "__main__":
             try:
                 # 1. Block and wait for at least one frame
                 fft_frame = pt_fft_q.get(timeout=1.0) 
-                occ_out_dict = pipeline.process_frame(fft_frame)
+                occ_out_dict = act_pipeline.process_frame(fft_frame)
+                frames_processed = 1
                 
                 # 2. Rapidly drain any EXTRA frames that piled up during the last screen draw
                 while not pt_fft_q.empty():
                     try:
                         fft_frame = pt_fft_q.get_nowait()
-                        occ_out_dict = pipeline.process_frame(fft_frame)
-
+                        occ_out_dict = act_pipeline.process_frame(fft_frame)
+                        frames_processed += 1
                     except queue.Empty:
                         break # Queue is fully caught up!
                 
-                # 3. Update the display exactly ONCE with the absolute freshest data
-                visualizer.update(occ_out_dict)
+                # 3. Respiratory Processing for Monitoring Zones
+                resp_dict = None
+                zone_name = occ_out_dict.get('zone', 'Unknown')
+                
+                # Identify if current position explicitly qualifies for breathing tracking
+                is_monitor = False
+                if zone_name in LAYOUT and LAYOUT[zone_name].get('type') == 'monitor':
+                    is_monitor = True
+                elif 'Bed' in zone_name:
+                    is_monitor = True
+                    
+                if is_monitor and occ_out_dict.get('status') != "No Occupant":
+                    try:
+                        resp_dict = resp_pipeline.process(occ_out_dict, frames=frames_processed)
+                    except Exception as e:
+                        print(f"[Main] Respiratory Error: {e}")
+                        resp_pipeline._reset_state()
+                else:
+                    if resp_pipeline.frames_since_present > 0:
+                        print(f"[Main] Run off-zone reset. Clearing ghost memory.")
+                    resp_pipeline._reset_state()
+
+                # 4. Update the display exactly ONCE with the absolute freshest data
+                visualizer.update(occ_out_dict, resp_dict, frames=frames_processed)
                 
                 # 4. Send Alert 
                 if SEND_ALERT and occ_out_dict['status'] != last_notified_state and "Initializing" not in occ_out_dict['status'] and (occ_out_dict['posture'] == "Fallen" or 'Apnea' in occ_out_dict['status']):
@@ -1807,8 +2175,9 @@ if __name__ == "__main__":
                     send_watch_alert(occ_out_dict['status'])  # Notification to Apple iPhone/Watch  (PushOver)
                     last_notified_state = occ_out_dict['status']
             except queue.Empty:
-                pipeline.empty_room()
-                visualizer.update(pipeline.output_dict)
+                act_pipeline.empty_room()
+                resp_pipeline._reset_state()
+                visualizer.update(act_pipeline.output_dict, None)
                 continue
             
     except KeyboardInterrupt:
