@@ -4,3 +4,11 @@ pyserial
 pandas
 requests
 scipy
+pydantic
+scipy
+pydantic
+pyyaml
+PyQt6
+pyqtgraph
+xarm
+hid
