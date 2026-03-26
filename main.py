@@ -429,10 +429,13 @@ class ActivityPipeline:
         # Only apply strict bed physics if they are in the bed AND lying down
         track_in_monitor = False
         if self.track_x is not None and self.current_active_zone is not None:
-            is_bed_zone = "Bed" in self.current_active_zone or "monitor" in self.current_active_zone.lower()
+            is_bed_zone = "Bed" in self.current_active_zone
             is_lying_down = getattr(self, 'track_z', 0.0) < SITTING_THRESHOLD
             
-            if is_bed_zone and is_lying_down:
+            # The Breakout: If they are actively shifting/moving out of the zone, let them go!
+            is_actively_moving = getattr(self, 'motion_level', 0.0) > 0.25 
+            
+            if is_bed_zone and is_lying_down and not is_actively_moving:
                 track_in_monitor = True
 
         for c in candidates:
