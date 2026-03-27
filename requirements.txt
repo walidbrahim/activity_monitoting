@@ -11,4 +11,4 @@ pyyaml
 PyQt6
 pyqtgraph
 xarm
-hid
+hidapi

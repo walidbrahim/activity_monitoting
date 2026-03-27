@@ -81,7 +81,7 @@ class MainWindow(QMainWindow):
         # 1. Top Cards
         cards_layout = QHBoxLayout()
         self.occ_card = CardWidget("Occupancy", ["Zone", "State", "Confidence", "Duration"])
-        self.post_card = CardWidget("Posture & Motion", ["Posture", "Posture conf.", "Height", "Motion"])
+        self.post_card = CardWidget("Posture & Motion", ["Posture", "Posture conf.", "Height (Range)", "Motion"])
         self.sys_card = CardWidget("System", ["Radar", "Tracking", "Fall state", "Fall conf."])
         cards_layout.addWidget(self.occ_card)
         cards_layout.addWidget(self.post_card)
@@ -196,33 +196,7 @@ class MainWindow(QMainWindow):
         for name, bounds in config.layout.items():
             btype = bounds.get("type")
             
-            if btype == "sensor":
-                radar_x = bounds["x"]
-                radar_y = bounds["y"]
-                fov_deg = bounds.get("fov_deg", 120)
-                yaw_deg = bounds.get("yaw_deg", 210)
-                
-                # Draw Radar Point
-                radar_scatter = pg.ScatterPlotItem(x=[radar_x], y=[radar_y], size=15, symbol='t', brush=pg.mkBrush(config.gui_theme.radar))
-                self.radar_plot.addItem(radar_scatter)
-                radar_text = pg.TextItem("Radar", anchor=(0.5, 1.5), color=config.gui_theme.text)
-                radar_text.setPos(radar_x, radar_y)
-                self.radar_plot.addItem(radar_text)
-                
-                # Draw FOV Wedge
-                path = QPainterPath()
-                path.moveTo(0, 0)
-                # PyQtGraph inverts the Y axis dynamically, so we must invert our QPainterPath angle (-visual_angle)
-                path.arcTo(-5, -5, 10, 10, yaw_deg - 90 - fov_deg/2, fov_deg)
-                path.closeSubpath()
-                
-                fov_item = pg.QtWidgets.QGraphicsPathItem(path)
-                fov_item.setPos(radar_x, radar_y)
-                fov_item.setPen(pg.mkPen(color=config.gui_theme.fov, style=Qt.PenStyle.DashLine))
-                fov_item.setBrush(pg.mkBrush(QColor(config.gui_theme.fov).getRgb()[:3] + (15,)))
-                self.radar_plot.addItem(fov_item)
-                continue
-                
+
             x_min, x_max = bounds["x"]
             y_min, y_max = bounds["y"]
             w, h = x_max - x_min, y_max - y_min
@@ -245,9 +219,40 @@ class MainWindow(QMainWindow):
                 
             self.radar_plot.addItem(rect)
             
+            if not hasattr(self, 'zone_rects'):
+                self.zone_rects = {}
+            self.zone_rects[name] = {"item": rect, "color": color, "base_alpha": 30 if btype == "ignore" else alpha}
+            
             text = pg.TextItem(name, anchor=(0.5, 0.5), color=config.gui_theme.text)
             text.setPos(x_min + w/2, y_min + h/2)
             self.radar_plot.addItem(text)
+            
+        # Draw Default Radar Point & FOV (Using fallback chain)
+        d_zone = getattr(config.app, "default_radar_pose", "Room")
+        d_pose = config.layout.get(d_zone, {}).get("radar_pose", None)
+        room_pose = config.layout.get("Room", {}).get("radar_pose", {})
+        
+        radar_x = d_pose.get("x") if d_pose else room_pose.get("x", 1.22)
+        radar_y = d_pose.get("y") if d_pose else room_pose.get("y", 3.27)
+        fov_deg = d_pose.get("fov_deg", 120) if d_pose else room_pose.get("fov_deg", 120)
+        yaw_deg = d_pose.get("yaw_deg", 180) if d_pose else room_pose.get("yaw_deg", 180)
+        
+        self.static_radar_scatter = pg.ScatterPlotItem(x=[radar_x], y=[radar_y], size=15, symbol='t', brush=pg.mkBrush(config.gui_theme.radar))
+        self.radar_plot.addItem(self.static_radar_scatter)
+        self.static_radar_text = pg.TextItem("Radar", anchor=(0.5, 1.5), color=config.gui_theme.text)
+        self.static_radar_text.setPos(radar_x, radar_y)
+        self.radar_plot.addItem(self.static_radar_text)
+        
+        path = QPainterPath()
+        path.moveTo(0, 0)
+        path.arcTo(-5, -5, 10, 10, yaw_deg - 90 - fov_deg/2, fov_deg)
+        path.closeSubpath()
+        
+        self.static_fov_item = pg.QtWidgets.QGraphicsPathItem(path)
+        self.static_fov_item.setPos(radar_x, radar_y)
+        self.static_fov_item.setPen(pg.mkPen(color=config.gui_theme.fov, style=Qt.PenStyle.DashLine))
+        self.static_fov_item.setBrush(pg.mkBrush(QColor(config.gui_theme.fov).getRgb()[:3] + (15,)))
+        self.radar_plot.addItem(self.static_fov_item)
             
         # Lock radar plot strictly to room boundaries with small padding
         self.radar_plot.setXRange(room_x[0] - 0.2, room_x[1] + 0.2, padding=0)
@@ -262,10 +267,38 @@ class MainWindow(QMainWindow):
         if "active" in s: return 0.90
         return 0.20
 
+    @pyqtSlot(float, float, float, float)
+    def update_radar_fov(self, x, y, yaw_deg, fov_deg=120):
+        if hasattr(self, 'static_radar_scatter'):
+            self.static_radar_scatter.setData(x=[x], y=[y])
+        if hasattr(self, 'static_radar_text'):
+            self.static_radar_text.setPos(x, y)
+        if hasattr(self, 'static_fov_item'):
+            from PyQt6.QtGui import QPainterPath
+            path = QPainterPath()
+            path.moveTo(0, 0)
+            path.arcTo(-5, -5, 10, 10, yaw_deg - 90 - fov_deg/2, fov_deg)
+            path.closeSubpath()
+            self.static_fov_item.setPath(path)
+            self.static_fov_item.setPos(x, y)
+
     @pyqtSlot(dict, dict)
     def update_dashboard(self, occ_dict, resp_dict):
         # Update Cards
         zone = occ_dict.get("zone", "--")
+        
+        # Highlight Logic
+        if hasattr(self, 'zone_rects'):
+            for name, data in self.zone_rects.items():
+                rect = data["item"]
+                color = data["color"]
+                base_alpha = data["base_alpha"]
+                
+                if name in zone:
+                    rect.setBrush(pg.mkBrush(QColor(color).getRgb()[:3] + (min(255, base_alpha + 100),)))
+                else:
+                    rect.setBrush(pg.mkBrush(QColor(color).getRgb()[:3] + (base_alpha,)))
+        
         state = occ_dict.get("status", "Waiting")
         mot_str = occ_dict.get("motion_str", "--")
         
@@ -277,10 +310,12 @@ class MainWindow(QMainWindow):
         )
 
         z = occ_dict.get("Z")
+        r = occ_dict.get("Range", 0.0)
+        height_range_str = f"{z:.2f} m ({r:.2f} m)" if z else "--"
         self.post_card.update_values(
             Posture=occ_dict.get("posture", "--"),
             **{"Posture conf.": f"{int(occ_dict.get('posture_confidence', 0))}%"},
-            Height=f"{z:.2f} m" if z else "--",
+            **{"Height (Range)": height_range_str},
             Motion=mot_str
         )
 

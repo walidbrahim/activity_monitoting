@@ -1,35 +1,45 @@
 graph TD
-    subgraph "Step 8: Confidence Index Generation"
-        Input8["<b>Input:</b> posture, height, thresholds, status, track_confidence,<br/>miss_counter, motion_level, dynamic_mag"] --> OccConf
+    subgraph "Step 7: Confidence Metrics & Final Output Assembly"
+        Input7["<b>Input:</b> posture, Z_b, status, track_confidence,<br/>miss_counter, motion_level, dynamic_mag_profile,<br/>current_raw_reflection"] --> OccConf
         
-        OccConf["<b>Occupancy Confidence</b><br/>Temporal: based on hit/miss track confidence"]
-        OccConf --> OccSignal["Adjust signal confidence based on status:<br/>Active (Mag above thresh)<br/>Apnea (Raw difference above margin)"]
-        OccSignal --> OccFinal["Weight and sum Temporal & Signal."]
-        OccFinal --> OccPenalty["Subtract penalty for active misses"]
+        OccConf["<b>Occupancy Confidence</b><br/>Temporal: (track_confidence / threshold) * 100"]
+        OccConf --> OccSignal{"Status type?"}
+        OccSignal -- "Breathing/Moving" --> SigActive["signal_conf from margin above<br/>detection_threshold<br/>(100% if motion > 0.05)"]
+        OccSignal -- "Apnea/Still" --> SigApnea["signal_conf from margin above<br/>occupied_reflection * 0.70"]
+        OccSignal -- Other --> SigDefault["signal_conf = 100%"]
         
-        OccPenalty --> PostureConf["<b>Posture Confidence</b><br/>Distance from current height to nearest thresh boundary"]
-        PostureConf --> PosturePenalty["Subtract penalty based on high motion level"]
+        SigActive --> OccFinal["occ_confidence = 0.6*temporal + 0.4*signal"]
+        SigApnea --> OccFinal
+        SigDefault --> OccFinal
+        OccFinal --> OccPenalty["Subtract penalty for active misses<br/>(miss_counter / miss_allowance) * 100"]
+        
+        OccPenalty --> PostureConf["<b>Posture Confidence</b><br/>Base = 50 + (dist_to_nearest_threshold / 0.125) * 50<br/>Varies by posture type"]
+        PostureConf --> PosturePenalty["Subtract motion_level penalty<br/>(capped at 40, floor at 50%)"]
     end
     
-    PosturePenalty --> Input9["<b>Input:</b> Final stable zone, is_valid_point, output_dict"]
+    PosturePenalty --> ZoneTimer
     
-    subgraph "Step 9: Zone Timer Update"
-        Input9 --> CallTimer["Call _update_zone_timer with stable zone and validity"]
+    subgraph "Zone Timer & Output Compilation"
+        ZoneTimer["<b>Update Zone Timer</b><br/>_update_zone_timer(zone, is_valid, now)"]
         
-        subgraph "_update_zone_timer internal logic"
-            CallTimer --> New{"Zone changed?"}
-            New -- Yes --> StartT["Store start time"]
-            New -- No --> UpSeen["Update last_seen time"]
+        subgraph "_update_zone_timer logic"
+            ZoneTimer --> New{"Zone changed?"}
+            New -- Yes --> StartT["Reset timer start"]
+            New -- No --> UpSeen["Update last_seen"]
             
-            StartT --> Dropout{"Valid Point False?"}
+            StartT --> Dropout{"No valid detection?"}
             UpSeen --> Dropout
             
-            Dropout -- Yes --> Hold{"Wait now - last_seen > <br/>zone_timer_hold_sec (3.0s)?"}
-            Hold -- Yes --> KillTimer["Reset Timer (None)"]
-            Hold -- No --> OutputU
-            Dropout -- No --> OutputU["Update Status"]
+            Dropout -- Yes --> Hold{"Elapsed > hold_sec (3.0s)?"}
+            Hold -- Yes --> KillTimer["Reset timer to None"]
+            Hold -- No --> TimerOK["Timer still alive"]
+            Dropout -- No --> TimerOK
         end
         
-        KillTimer --> OutputFinalCompile
-        OutputU --> OutputFinalCompile["Format duration string,<br/>Compile final output_dict"]
+        KillTimer --> BuildOutput
+        TimerOK --> BuildOutput
+        
+        BuildOutput["<b>Build Ordered Spectral History</b><br/>_get_ordered_history() from ring buffer<br/>for downstream respiration pipeline"]
+        
+        BuildOutput --> OutputFinal["<b>Compile output_dict</b><br/>X, Y, Z, final_bin, zone, status,<br/>occ_confidence, posture_confidence,<br/>posture, motion_str, duration_str,<br/>fall_confidence, spectral_history,<br/><b>is_valid = True</b>"]
     end

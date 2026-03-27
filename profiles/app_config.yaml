@@ -5,14 +5,13 @@ layout:
     y: [0.0, 3.5]
     z: [0.0, 2.7]
     arm_move: [500, 500, 500, 500, 500, 500] # Default wide-view pose when empty
-  Radar:
-    type: "sensor"
-    x: 1.15
-    y: 3.27
-    z: 1.0
-    yaw_deg: 210
-    pitch_deg: -30
-    fov_deg: 120
+    radar_pose:
+      x: 1.22
+      y: 3.27
+      z: 1.03
+      yaw_deg: 180
+      pitch_deg: 0
+      fov_deg: 120
   Bed:
     type: "monitor"
     x: [0.0, 1.05]
@@ -20,19 +19,40 @@ layout:
     z: [0.0, 2.7]
     margin_x: [0.3, 0.3]
     margin_y: [0.3, 0.0]
-    arm_move: [0, 0, 0, 0, 0, 0] # motor positions
+    arm_move: [500, 500, 200, 500, 500, 300] # motor positions
+    radar_pose:
+      x: 1.15
+      y: 3.27
+      z: 1.0
+      yaw_deg: 210
+      pitch_deg: -35
+      fov_deg: 120
   Desk:
     type: "ignore"
     x: [1.95, 2.58]
     y: [1.6, 2.64]
     z: [0.0, 1.2]
-    arm_move: [0, 0, 0, 0, 0, 0] # motor positions
+    arm_move: [500, 500, 500, 500, 500, 500] # motor positions
+    radar_pose:
+      x: 1.15
+      y: 3.27
+      z: 1.0
+      yaw_deg: 240
+      pitch_deg: -25
+      fov_deg: 120
   Chair:
     type: "monitor"
     x: [1.5, 2.0]
     y: [1.6, 2.64]
     z: [0.0, 1.2]
-    arm_move: [0, 0, 0, 0, 0, 0] # motor positions
+    arm_move: [500, 500, 500, 500, 500, 600] # motor positions
+    radar_pose:
+      x: 1.15
+      y: 3.27
+      z: 1.0
+      yaw_deg: 150
+      pitch_deg: 0
+      fov_deg: 120
 
 pushover:
   user_key: "ua846nsmwipsvkvk2r7guc1koekhnf"
@@ -61,10 +81,18 @@ pipeline:
   detection_threshold: 150.0
   static_margin: 200
   alpha: 0.05
-  track_alpha: 0.2
+  track_alpha: 0.05
   frame_to_confirm_zone: 50
-  buffer_size: 10
+  buffer_size: 50
   miss_allowance: 25
+  features:
+    clutter_removal: true
+    vital_analysis: true
+    tethering: false
+    apnea_state: true
+    temporal_persistence: true
+    adaptive_smoothing: true
+    fall_posture: true
 
 posture:
   fall_detection_enable: true
@@ -84,6 +112,8 @@ app:
   log_level: 10
   need_send_ti_config: true
   send_alert: false
+  enable_robot_arm: false
+  default_radar_pose: "Bed"
 
 gui_theme:
   fig_bg: "#111827"
@@ -104,3 +134,15 @@ gui_theme:
   fov: "#EF4444"
   radar: "#F43F5E"
   origin: "#FACC15"
+
+tuning:
+  min_search_range: 0.30
+  num_candidates: 15
+  ghost_phase_threshold: 0.0005
+  macro_displacement_mm: 15.0
+  z_clip_min: 0.05
+  z_clip_max: 1.80
+  jump_reject_distance: 1.5
+  warmup_seconds: 1.0
+  entry_hold_seconds: 3.0
+  reassess_seconds: 3.0

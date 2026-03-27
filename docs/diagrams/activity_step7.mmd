@@ -1,44 +1,44 @@
 graph TD
-    Input7["<b>Input:</b> Smoothed X,Y,Z, v_z, motion_level,<br/>is_fallen, persistence_frames, status"] --> ReZone
+    Input6["<b>Input:</b> X_b, Y_b, Z_b, v_z, motion_level,<br/>is_fallen, persistence_frames, status"] --> ReZone
     
-    subgraph "Zone Debouncing"
-        ReZone["Call evaluate_spatial_zone with smoothed coords"]
-        ReZone --> CheckStable["Is Zone != current_stable_zone?"]
-        CheckStable -- Yes --> PushHist["Push to zone_history"]
-        PushHist --> Persist{"Did new zone persist<br/>for FRAME_TO_CONFIRM_ZONE frames?"}
-        Persist -- Yes --> SetStable["Set current_stable_zone = New Zone"]
-        Persist -- No --> KeepStable["Final Zone = current_stable_zone"]
+    subgraph "Counter-Based Zone Debouncing"
+        ReZone["evaluate_spatial_zone(X_b, Y_b, Z_b)"]
+        ReZone --> PushHist["Append zone to zone_history<br/>(deque, maxlen=frames_to_confirm_zone)"]
+        PushHist --> FullCheck{"zone_history full?"}
+        FullCheck -- Yes --> CountVote["<b>Counter(zone_history).most_common(1)</b><br/>O(n) frequency vote"]
+        CountVote --> SetStable["current_stable_zone = winner"]
+        FullCheck -- No --> KeepStable["Use current_stable_zone"]
         SetStable --> KeepStable
-        CheckStable -- No --> ClearHist["Clear zone_history"]
-        ClearHist --> KeepStable
     end
     
-    subgraph "Basic Posture & Motion Tagging"
-        KeepStable --> PostureLogic["<b>Posture Recognition</b><br/>Height > Stand Thresh: Standing<br/>Height > Sit Thresh: Sitting<br/>Else: Lying Down"]
-        PostureLogic --> MotionLogic["<b>Motion Tagging</b><br/>If Apnea status: Static<br/>Else if Motion < REST_MAX: Resting<br/>Else if Motion < RESTLESS: Restless<br/>Else: Major Movement"]
+    subgraph "Posture & Motion Tagging"
+        KeepStable --> PostureLogic["<b>Posture by Height</b><br/>Z > standing_threshold: Standing<br/>Z > sitting_threshold: Sitting<br/>Else: Lying Down"]
+        PostureLogic --> MotionLogic["<b>Motion Tagging</b><br/>Apnea status → Static<br/>motion > restless_max → Major Movement<br/>MACRO_PHASE in Bed/Chair → Postural Shift<br/>motion > rest_max → Restless/Shifting<br/>MICRO_PHASE → Restless/Fidgeting<br/>Else → Resting/Breathing"]
     end
     
-    subgraph "Critical Fall Logic & Overrides"
-        MotionLogic --> ZoneGate{"Final Zone is<br/>Ignored/Ghost?"}
+    subgraph "Fall Detection (Height + Persistence + Velocity)"
+        MotionLogic --> ZoneGate{"Zone is<br/>Ghost/Ignored?"}
+        ZoneGate -- Yes --> KillTrack["Kill track, abort"]
         
-        ZoneGate -- Yes --> KillTrack["KILL TRACK IMMEDIATELY.<br/>Return Lost Status."]
+        ZoneGate -- No --> FloorGate{"Zone is<br/>Floor/Transit?"}
+        FloorGate -- No --> BedSafe["Reset fall logic<br/>(is_fallen=False, persistence=0)"]
+        BedSafe --> Output6
         
-        ZoneGate -- No --> FloorGate{"Final Zone is Floor/Transit?"}
+        FloorGate -- Yes --> FloorAdjust["Status → 'In Room'"]
         
-        FloorGate -- Yes --> FloorAdjust["Update status to 'In Room'"]
-        FloorAdjust --> HeightGate{"Height <= <br/>Fall Threshold?"}
-        HeightGate -- Yes --> VelocityGate{"v_z <= Fall Velocity Thresh OR<br/>already is_fallen latched?"}
-        VelocityGate -- Yes --> Fallen["Latch is_fallen=True,<br/>Increment persistence_frames"]
-        Fallen --> ScoreFall["<b>Calculate Fall Confidence (Weighted)</b><br/>Height Score (closer to floor) + Time Score (longer duration)"]
+        FloorAdjust --> VelocityTrigger{"v_z < fall_velocity_threshold<br/>AND not already fallen?"}
+        VelocityTrigger -- Yes --> RapidFall["<b>RAPID DESCENT DETECTED</b><br/>Latch is_fallen=True immediately<br/>(catches fall before hitting floor)"]
+        VelocityTrigger -- No --> HeightGate{"Z <= fall_threshold<br/>OR is_fallen latched?"}
+        RapidFall --> HeightGate
+        
+        HeightGate -- Yes --> Fallen["is_fallen=True,<br/>Increment persistence_frames"]
+        Fallen --> ScoreFall["<b>Fall Confidence (3-component)</b><br/>h_score (30%): proximity to floor<br/>p_score (40%): duration on floor<br/>v_score (30%): descent velocity magnitude"]
         ScoreFall --> CritGate{"Confidence > 60%?"}
-        CritGate -- Yes --> SetCritFall["status=CRITICAL Fall Detected,<br/>posture=Fallen"]
-        CritGate -- No --> Output7
+        CritGate -- Yes --> SetCrit["status=CRITICAL Fall Detected<br/>posture=Fallen"]
+        CritGate -- No --> Output6
         
-        VelocityGate -- No --> SitFloor["Sitting slowly on floor.<br/>is_fallen=False, decrement persistence"]
-        SitFloor --> Output7
-        HeightGate -- No --> ResetFall["Reset fall logic<br/>is_fallen=False, persistence=0"]
-        ResetFall --> Output7
-        
-        FloorGate -- No --> BedResetFall["Person safe in bed/chair.<br/>Reset fall logic."]
-        BedResetFall --> Output7
+        HeightGate -- No --> Recover["Decrement persistence_frames<br/>(slow recovery)"]
+        Recover --> Output6
     end
+    
+    SetCrit --> Output6["<b>Output:</b> final_zone, posture,<br/>motion_str, status, fall_confidence"]

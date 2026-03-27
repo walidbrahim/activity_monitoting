@@ -37,6 +37,15 @@ class RadarConfig(BaseModel):
     tx_ant: int
     rx_ant: int
 
+class PipelineFeatures(BaseModel):
+    clutter_removal: bool = True
+    vital_analysis: bool = True
+    tethering: bool = True
+    apnea_state: bool = True
+    temporal_persistence: bool = True
+    adaptive_smoothing: bool = True
+    fall_posture: bool = True
+
 class PipelineConfig(BaseModel):
     detection_threshold: float
     static_margin: int
@@ -45,6 +54,7 @@ class PipelineConfig(BaseModel):
     frame_to_confirm_zone: int
     buffer_size: int
     miss_allowance: int
+    features: PipelineFeatures = Field(default_factory=PipelineFeatures)
 
 class PostureConfig(BaseModel):
     fall_detection_enable: bool
@@ -60,10 +70,24 @@ class MotionConfig(BaseModel):
 class RespirationConfig(BaseModel):
     resp_window_sec: int
 
+class TuningConfig(BaseModel):
+    min_search_range: float = 0.30
+    num_candidates: int = 15
+    ghost_phase_threshold: float = 0.0005
+    macro_displacement_mm: float = 15.0
+    z_clip_min: float = 0.05
+    z_clip_max: float = 1.80
+    jump_reject_distance: float = 1.5
+    warmup_seconds: float = 1.0
+    entry_hold_seconds: float = 3.0
+    reassess_seconds: float = 3.0
+
 class AppFlagsConfig(BaseModel):
     log_level: int
     need_send_ti_config: bool
     send_alert: bool
+    enable_robot_arm: bool = True
+    default_radar_pose: Optional[str] = "Room"
 
 class GuiThemeConfig(BaseModel):
     fig_bg: str
@@ -95,6 +119,7 @@ class AppConfig(BaseModel):
     respiration: RespirationConfig
     app: AppFlagsConfig
     gui_theme: GuiThemeConfig
+    tuning: TuningConfig = Field(default_factory=TuningConfig)
 
     @classmethod
     def load(cls, file_path: str = "profiles/app_config.yaml") -> "AppConfig":

@@ -1,64 +1,69 @@
 graph TD
-    Input["<b>Input:</b> dynamic_data,<br/>dynamic_mag_profile"] --> InitSearch["Set min search bin (30cm)"]
+    Input["<b>Input:</b> dynamic_data,<br/>dynamic_mag_profile"] --> InitSearch["Set min_search_bin from<br/>config.tuning.min_search_range"]
     
-    InitSearch --> FindPeaks["Identify top 15 peaks in Dynamic Mag Profile<br/>(above min distance)"]
-    FindPeaks --> LoopCand["<b>Iterate over Candidate Peaks</b>"]
+    InitSearch --> FindPeaks["Identify top N peaks in Dynamic Mag Profile<br/>(N = config.tuning.num_candidates)"]
+    FindPeaks --> GetOrdered["<b>Get Ordered Spectral History</b><br/>Reconstruct time-ordered view from ring buffer"]
+    GetOrdered --> LoopCand["<b>Iterate over Candidate Peaks</b>"]
     
     subgraph "1. Angle Estimation & 3D Projection (DSP)"
         LoopCand --> GetChan["Get 8-channel complex data for this bin"]
-        GetChan --> FormatMat["Format Antenna Matrix S_cand"]
-        FormatMat --> EstAngle["Estimate Phase Angle via Sum/Conj:<br/>om_az (Azimuth), om_el (Elevation)"]
-        EstAngle --> CalcAngle["Convert Phase to Angles:<br/>az_cand, el_cand (arcsin)"]
+        GetChan --> FormatMat["Format Antenna Matrix S_cand (4x2)"]
+        FormatMat --> EstAngle["Estimate Phase via Sum/Conj:<br/>om_az (Azimuth), om_el (Elevation)"]
+        EstAngle --> CalcAngle["Convert Phase to Angles:<br/>az_cand, el_cand (arcsin + clip)"]
         CalcAngle --> ProjRad["<b>Project to Radar Coords (Pr_c)</b><br/>X=R*sin(Az)*cos(El),<br/>Y=R*cos(Az)*cos(El),<br/>Z=R*sin(El)"]
-        ProjRad --> ProjRoom["<b>Project to Room Coords (Pb_c)</b><br/>Apply Rotation Matrix self.R,<br/>Add Translation Vector self.T"]
+        ProjRad --> ProjRoom["<b>Project to Room Coords (Pb_c)</b><br/>Apply Rotation Matrix (from _build_rotation),<br/>Add Translation Vector T"]
     end
     
     subgraph "2. Spatial Evaluation & Vital Sign Gating"
-        ProjRoom --> ZoneEval["Call evaluate_spatial_zone with Room Coords"]
-        ZoneEval --> IsRoom{"Is Point valid AND<br/>not Ghost Zone?"}
+        ProjRoom --> ZoneEval["evaluate_spatial_zone(x, y, z)"]
+        ZoneEval --> IsRoom{"Valid target AND<br/>not Ghost Zone?"}
         
-        IsRoom -- Yes --> CheckSpectral["Is Spectral Buffer full?"]
+        IsRoom -- Yes --> CheckSpectral{"Spectral Buffer<br/>full?"}
         IsRoom -- No --> Next["Next Candidate"]
         
-        CheckSpectral -- Yes --> PhaseExt["Extract Phase History for this bin"]
-        CheckSpectral -- No --> SetLowMult["Vital Multiplier = 0.1"]
+        CheckSpectral -- Yes --> PhaseExt["Extract Phase History from ordered spectral"]
+        CheckSpectral -- No --> SetLowMult["vital_mult = 0.1<br/>micro_state = STABLE"]
         
-        subgraph "Spectral Analysis (Breathing)"
-            PhaseExt --> Detrend["Unwrap Phase & Detrend (scipy.signal)"]
-            Detrend --> Window["Apply Hanning Window"]
-            Window --> FFT["<b>Slow-Time FFT (np.fft.rfft)</b><br/>Complex to Magnitude spectrum"]
-            FFT --> SNRC["Define Breathing (0.15-0.5Hz) & Noise (1-3Hz) bands.<br/>Calculate <b>Breathing SNR</b>"]
-            SNRC --> Logic{"Is SNR > 1.0 (Breathing)?<br/>Else SNR > 0.6 (Active)?<br/>Else Phase Jump > 10 (Major Motion)?"}
-            Logic -- Breathing --> V1["Vital Mult = 1.0"]
-            Logic -- Active --> V2["Vital Mult = 0.5"]
-            Logic -- Major --> V3["Vital Mult = 0.9"]
-            Logic -- Static/Noisy --> V4["Vital Mult = 0.1"]
+        subgraph "Phase-Variance / SQI Classification"
+            PhaseExt --> UnwrapPhase["Unwrap Phase, Compute phase_var & displacement_mm"]
+            UnwrapPhase --> VarGate{"phase_var < ghost_threshold?"}
+            VarGate -- Yes --> V_Ghost["vital_mult = 0.01<br/>micro_state = STATIC_GHOST"]
+            VarGate -- No --> DispGate{"displacement_mm > macro_thresh?"}
+            DispGate -- Yes --> V_Macro["vital_mult = 0.9<br/>micro_state = MACRO_PHASE"]
+            DispGate -- No --> MicroGate{"phase_var > 0.3?"}
+            MicroGate -- Yes --> V_Micro["vital_mult = 0.7<br/>micro_state = MICRO_PHASE"]
+            MicroGate -- No --> SQI["<b>Spectral Quality Index (SQI)</b><br/>Detrend, Hanning Window, FFT<br/>SQI = vital_energy(0.15-0.7Hz) /<br/>total_energy(0.15-3.0Hz)"]
+            SQI --> SQIGate{"SQI > 0.45?"}
+            SQIGate -- Yes --> V_Bio["vital_mult = 1.0<br/>(Biological/Breathing)"]
+            SQIGate -- No --> SQIMed{"SQI > 0.25?"}
+            SQIMed -- Yes --> V_Amb["vital_mult = 0.5"]
+            SQIMed -- No --> V_Dead["vital_mult = 0.05<br/>micro_state = DEAD_SPACE"]
         end
         
-        V1 --> PushValid["Add to valid_candidates list"]
-        V2 --> PushValid
-        V3 --> PushValid
-        V4 --> PushValid
+        V_Ghost --> PushValid["Add to valid_candidates list"]
+        V_Macro --> PushValid
+        V_Micro --> PushValid
+        V_Bio --> PushValid
+        V_Amb --> PushValid
+        V_Dead --> PushValid
         SetLowMult --> PushValid
         PushValid --> Next
     end
     
-    Next --> DecExists{"Any Valid Candidates Found?"}
+    Next --> DecExists{"Any Valid<br/>Candidates?"}
     
-    subgraph "3. Candidate Scoring & Tethering"
-        DecExists -- Yes --> ScoreAll["<b>Score Candidates (use_tethering=True)</b><br/>Score = (Mag/MaxMag)*VitalMult + ZoneBonus - SpatialPenalty"]
+    subgraph "3. Candidate Scoring, Tethering & Jump Rejection"
+        DecExists -- Yes --> ScoreAll["<b>_score_candidates(use_tethering)</b><br/>Score = f(mag_ratio, vital_mult,<br/>zone_bonus, sticky_bin, anatomy_tether)<br/>Monitor mode: vital_mult weighted 2x"]
         
-        ScoreAll --> CheckReassess["Interval for Reassessment (every 3s)?"]
+        ScoreAll --> SelectBest["Select best candidate,<br/>Set current_active_zone & micro_state"]
+        SelectBest --> ClipZ["Clip Z to [z_clip_min, z_clip_max]<br/>from config.tuning"]
+        ClipZ --> JumpGate{"Track exists AND<br/>jump_dist > jump_reject_distance?"}
+        JumpGate -- Yes --> Reject["is_valid_point = False<br/>is_jump = True"]
+        JumpGate -- No --> Accept["is_valid_point = True"]
         
-        CheckReassess -- Yes --> ScoreUntether["Score WITHOUT Tethering"]
-        ScoreUntether --> Better?{"Is Untethered winner substantially better<br/>(Score + 0.2)?"}
-        Better? -- Yes --> SetWinnerU["Set Best=Untethered,<br/>Reset existing smoothed track"]
-        Better? -- No --> SetWinnerT["Set Best=Tethered Winner"]
-        CheckReassess -- No --> SetWinnerT
-        
-        SetWinnerT --> OutputC["<b>Output:</b> raw_x, raw_y, raw_z,<br/>is_valid_point=True,<br/>Current Zone"]
-        SetWinnerU --> OutputC
+        Accept --> OutputC["<b>Output:</b> raw_x, raw_y, raw_z,<br/>is_valid_point, is_jump,<br/>final_peak_bin, dynamic_peak_bin"]
+        Reject --> OutputC
     end
     
-    DecExists -- No --> Fallback["is_valid_point=False<br/>Target raw peak bin"]
+    DecExists -- No --> Fallback["is_valid_point = False<br/>Use top peak as dynamic_peak_bin"]
     Fallback --> OutputC

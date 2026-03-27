@@ -1,8 +1,10 @@
+import logging
 import numpy as np
+from collections import Counter, deque
 from scipy import signal
-import time
-from collections import deque
 from config import config
+
+logger = logging.getLogger(__name__)
 
 class ActivityPipeline:
     """
@@ -30,7 +32,7 @@ class ActivityPipeline:
 
         # Zone Debouncing (Stops the text from flickering)
         self.current_stable_zone = "No Occupant Detected"
-        self.zone_history = []
+        self.zone_history = deque(maxlen=config.pipeline.frame_to_confirm_zone)
         self.frames_to_confirm_zone = config.pipeline.frame_to_confirm_zone # Require 2 second (50 frames) of stability to change config.layout
 
         # Zone occupancy duration tracker
@@ -39,18 +41,71 @@ class ActivityPipeline:
         self.zone_timer_last_seen = None
         self.zone_timer_hold_sec = 3.0   # tolerate short detection dropouts
                 
-        # Radar Location (Room coordinates)
-        self.radar_x = config.layout["Radar"]["x"]
-        self.radar_y = config.layout["Radar"]["y"]
-        self.radar_z = config.layout["Radar"]["z"]
-        self.yaw_deg = config.layout["Radar"]["yaw_deg"]
-        self.pitch_deg = config.layout["Radar"]["pitch_deg"]
+        # Radar Location (Boot default fallback cascade)
+        d_zone = getattr(config.app, "default_radar_pose", "Room")
+        d_pose = config.layout.get(d_zone, {}).get("radar_pose", None)
+        room_pose = config.layout.get("Room", {}).get("radar_pose", {})
+        
+        self.radar_x = d_pose.get("x") if d_pose else room_pose.get("x", 1.22)
+        self.radar_y = d_pose.get("y") if d_pose else room_pose.get("y", 3.27)
+        self.radar_z = d_pose.get("z") if d_pose else room_pose.get("z", 1.03)
+        self.yaw_deg = d_pose.get("yaw_deg", 180) if d_pose else room_pose.get("yaw_deg", 180)
+        self.pitch_deg = d_pose.get("pitch_deg", 0) if d_pose else room_pose.get("pitch_deg", 0)
 
-        self.T = np.array([self.radar_x, self.radar_y, self.radar_z])
-    
-        # 2. Rotation Matrices (Which way is it looking?)
-        pitch_rad = np.radians(self.pitch_deg)
-        yaw_rad = np.radians(self.yaw_deg)
+        self.T, self.R = self._build_rotation(self.radar_x, self.radar_y, self.radar_z, self.yaw_deg, self.pitch_deg)
+
+        # Tracking & Persistence Variables
+        self.coord_buffer = deque(maxlen=config.pipeline.buffer_size)
+        self.buffer_size = config.pipeline.buffer_size        
+        self.track_confidence = 0   
+        self.confidence_threshold = 3 
+        self.miss_allowance = config.pipeline.miss_allowance       
+        self.miss_counter = 0
+
+        # Feature Flags
+        self.features = config.pipeline.features
+
+        # Track reassessment: periodically score without tethering to escape bad locks
+        self.reassess_interval = int(config.radar.frame_rate * config.tuning.reassess_seconds)
+        self.frames_since_reassess = 0
+
+        # ==========================================
+        # Fall Detection Parameters
+        # ==========================================
+        self.z_history = deque(maxlen=50)
+        self.z_history_size = 50           # Store last ~2 second of Z data 
+        self.fall_threshold_z = config.posture.fall_threshold       # Height below which a person is 'on the floor' (meters)
+        self.fall_velocity_threshold = config.posture.fall_velocity_threshold # Velocity threshold for a rapid drop (m/s)
+        self.fall_persistence_frames = 0   # How long have they been on the floor
+        self.is_fallen = False             # Latching boolean for fall state
+
+        # Warmup Parameters
+        self.warmup_frames = int(config.radar.frame_rate * config.tuning.warmup_seconds)
+        
+        # Vital Gating History Buffer — ring buffered
+        self.vital_gate_frames = 10 * config.radar.frame_rate 
+        self.complex_history = np.zeros((self.num_range_bins, self.vital_gate_frames), dtype=complex)
+
+        # 10 seconds of history for high-res breathing extraction — ring buffered
+        self.spectral_frames = config.respiration.resp_window_sec * config.radar.frame_rate 
+        self.spectral_history = np.zeros((self.num_range_bins, self.spectral_frames), dtype=complex)
+
+        # Ring buffer write index (shared by both history arrays)
+        self._ring_idx_complex = 0
+        self._ring_idx_spectral = 0
+
+        self.output_dict = {}
+        self.apnea_frames = 0
+        self.entry_frames = 0
+        self.frames_to_occupy = int(config.radar.frame_rate * config.tuning.entry_hold_seconds)
+        self.empty_room()
+
+    @staticmethod
+    def _build_rotation(x, y, z, yaw_deg, pitch_deg):
+        """Build translation vector and rotation matrix from radar pose."""
+        T = np.array([x, y, z])
+        pitch_rad = np.radians(pitch_deg)
+        yaw_rad = np.radians(yaw_deg)
         
         # Pitch: Rotates the beam up/down (around the X axis)
         R_pitch = np.array([
@@ -59,7 +114,7 @@ class ActivityPipeline:
             [0, np.sin(pitch_rad), np.cos(pitch_rad)]
         ])
         
-        # Yaw: Rotates the beam left/right (around the Z axis)   --->  (0 = +Y, 90 = +X, -90 = -X)
+        # Yaw: Rotates the beam left/right (around the Z axis)   ---> (0 = +Y, 90 = +X, -90 = -X)
         R_yaw = np.array([
             [np.cos(yaw_rad), np.sin(yaw_rad), 0],
             [-np.sin(yaw_rad), np.cos(yaw_rad), 0],
@@ -67,47 +122,15 @@ class ActivityPipeline:
         ])
         
         # Master Rotation Matrix: Apply Pitch, then Yaw
-        self.R = np.dot(R_yaw, R_pitch)
+        R = np.dot(R_yaw, R_pitch)
+        return T, R
 
-        # Tracking & Persistence Variables
-        self.coord_buffer = []      
-        self.buffer_size = config.pipeline.buffer_size        
-        self.track_confidence = 0   
-        self.confidence_threshold = 3 
-        self.miss_allowance = config.pipeline.miss_allowance       
-        self.miss_counter = 0
-
-        # Track reassessment: periodically score without tethering to escape bad locks
-        self.reassess_interval = config.radar.frame_rate * 3  # Every 3 seconds
-        self.frames_since_reassess = 0
-
-        # ==========================================
-        # Fall Detection Parameters
-        # ==========================================
-        self.z_history = []
-        self.z_history_size = 50           # Store last ~2 second of Z data 
-        self.fall_threshold_z = config.posture.fall_threshold       # Height below which a person is 'on the floor' (meters)
-        self.fall_velocity_threshold = config.posture.fall_velocity_threshold # Velocity threshold for a rapid drop (m/s)
-        self.fall_persistence_frames = 0   # How long have they been on the floor
-        self.is_fallen = False             # Latching boolean for fall state
-
-        # Warmup Parameters
-        self.warmup_frames = config.radar.frame_rate * 1 
-        
-        # Vital Gating History Buffer
-        # Keep 5 seconds of complex data for all bins to evaluate biological motion
-        self.vital_gate_frames = 10*config.radar.frame_rate 
-        self.complex_history = np.zeros((self.num_range_bins, self.vital_gate_frames), dtype=complex)
-
-        # 10 seconds of history for high-res breathing extraction
-        self.spectral_frames = config.respiration.resp_window_sec * config.radar.frame_rate 
-        self.spectral_history = np.zeros((self.num_range_bins, self.spectral_frames), dtype=complex)
-
-        self.output_dict = {}
-        self.apnea_frames = 0
-        self.entry_frames = 0
-        self.frames_to_occupy = int(config.radar.frame_rate * 3.0)
-        self.empty_room()
+    def _get_ordered_history(self, history, ring_idx, total_frames):
+        """Return a contiguous time-ordered view of a ring-buffered 2D array."""
+        idx = ring_idx % total_frames
+        if idx == 0:
+            return history
+        return np.concatenate([history[:, idx:], history[:, :idx]], axis=1)
 
     def _score_candidates(self, candidates, max_mag, use_tethering):
         best, best_s = None, -float('inf')
@@ -177,6 +200,22 @@ class ActivityPipeline:
                 
         return best, best_s
 
+    def update_radar_pose(self, x, y, z, yaw_deg, pitch_deg, fov_deg=120):
+        self.radar_x, self.radar_y, self.radar_z = x, y, z
+        self.yaw_deg, self.pitch_deg = yaw_deg, pitch_deg
+        self.T, self.R = self._build_rotation(x, y, z, yaw_deg, pitch_deg)
+
+        self.clutter_map.fill(0)
+        self.is_occupied = False
+        self.track_x = self.track_y = self.track_z = None
+        self.coord_buffer.clear()
+        self.zone_history.clear()
+        self.complex_history.fill(0)
+        self.spectral_history.fill(0)
+        self._ring_idx_complex = 0
+        self._ring_idx_spectral = 0
+        self.frame_count = 0  
+
     def empty_room(self):
         self.motion_level = 0.0
         self.current_micro_state = "STABLE"
@@ -196,6 +235,7 @@ class ActivityPipeline:
             "duration_str": "",
             "fall_confidence": 0,
             "micro_state": "STABLE",
+            "is_valid": False,
         }
 
     def _update_zone_timer(self, zone_name, valid_detection, now):
@@ -300,19 +340,33 @@ class ActivityPipeline:
 
         raw_mag_profile = np.sum(np.abs(corrected_data), axis=1)
 
+        if not getattr(self.features, 'clutter_removal', True):
+            return {
+                "corrected_data": corrected_data,
+                "dynamic_data": corrected_data,
+                "dynamic_mag_profile": raw_mag_profile,
+                "raw_mag_profile": raw_mag_profile
+            }
+
         if self.baseline_profile is None:
             self.baseline_profile = raw_mag_profile.copy()
-        elif not self.is_occupied and self.frame_count > self.warmup_frames:
-            self.baseline_profile = (0.01 * raw_mag_profile) + (0.99 * self.baseline_profile)
 
         if self.frame_count <= self.warmup_frames:
-            current_alpha = 0.3
-        elif self.is_occupied:
-            current_alpha = 0.01
+            current_alpha_array = np.full(self.num_range_bins, 0.3)
+        elif not self.is_occupied or getattr(self, 'last_target_bin', None) is None:
+            # Evaporate ghosts globally while empty
+            current_alpha_array = np.full(self.num_range_bins, self.alpha)
         else:
-            current_alpha = 0.05
-            
-        self.clutter_map = (current_alpha * corrected_data) + ((1 - current_alpha) * self.clutter_map)
+            # Spatially Masked Learning: Freeze background map only near the user!
+            # Evaporate ghosts elsewhere rapidly.
+            dist_bins = np.abs(np.arange(self.num_range_bins) - self.last_target_bin)
+            # Full protection (<2 bins), scaling up to fast evaporation (>10 bins)
+            protection_mask = np.clip((dist_bins - 2.0) / 8.0, 0.0, 1.0)
+            current_alpha_array = 0.001 + protection_mask * (self.alpha - 0.001)
+
+        # Apply array multiplications via broadcasting (num_range_bins x antennas)
+        alpha_matrix = current_alpha_array[:, np.newaxis]
+        self.clutter_map = (alpha_matrix * corrected_data) + ((1.0 - alpha_matrix) * self.clutter_map)
         dynamic_data = corrected_data - self.clutter_map
         dynamic_mag_profile = np.sum(np.abs(dynamic_data), axis=1)
 
@@ -331,11 +385,13 @@ class ActivityPipeline:
             self.coord_buffer.clear()
             self.track_confidence = 0
 
-        self.complex_history = np.roll(self.complex_history, -1, axis=1)
-        self.complex_history[:, -1] = np.sum(dynamic_data, axis=1)
+        # Ring-buffered history writes (O(1), no allocation)
+        summed = np.sum(dynamic_data, axis=1)
+        self.complex_history[:, self._ring_idx_complex % self.vital_gate_frames] = summed
+        self._ring_idx_complex += 1
 
-        self.spectral_history = np.roll(self.spectral_history, -1, axis=1)
-        self.spectral_history[:, -1] = np.sum(dynamic_data, axis=1)
+        self.spectral_history[:, self._ring_idx_spectral % self.spectral_frames] = summed
+        self._ring_idx_spectral += 1
 
         return {
             "corrected_data": corrected_data,
@@ -345,9 +401,9 @@ class ActivityPipeline:
         }
 
     def _step2_spatial_candidates(self, dynamic_data, dynamic_mag_profile):
-        min_search_bin = int(0.30 / self.range_res)
+        min_search_bin = int(config.tuning.min_search_range / self.range_res)
         is_valid_point = False
-        num_candidates = 15 
+        num_candidates = config.tuning.num_candidates
 
         actual_candidates = min(num_candidates, len(dynamic_mag_profile[min_search_bin:]))
         if actual_candidates == 0:
@@ -358,6 +414,9 @@ class ActivityPipeline:
 
         sorted_peaks = all_peaks[np.argsort(dynamic_mag_profile[all_peaks])][::-1]
         final_peak_bin = None
+
+        # Get time-ordered spectral history for vital analysis
+        ordered_spectral = self._get_ordered_history(self.spectral_history, self._ring_idx_spectral, self.spectral_frames)
 
         valid_candidates = []
         raw_x, raw_y, raw_z = 0, 0, 0
@@ -384,8 +443,11 @@ class ActivityPipeline:
                 cand_micro_state = "STABLE"
                 vital_multiplier = 0.1
                 
-                if (self.frame_count - self.warmup_frames) > self.spectral_frames:
-                    cand_history = self.spectral_history[cand_bin, :]
+                # Aliveness check
+                if not getattr(self.features, 'vital_analysis', True):
+                    vital_multiplier = 1.0
+                elif (self.frame_count - self.warmup_frames) > self.spectral_frames:
+                    cand_history = ordered_spectral[cand_bin, :]
                     cand_history_safe = np.where(cand_history == 0, 1e-10 + 1e-10j, cand_history)
                     cand_phase = np.unwrap(np.angle(cand_history_safe))
                     
@@ -395,7 +457,10 @@ class ActivityPipeline:
                     phase_diff = np.diff(cand_phase)
                     phase_var = np.var(phase_diff)
                     
-                    if displacement_mm > 15.0:
+                    if phase_var < config.tuning.ghost_phase_threshold:
+                        vital_multiplier = 0.01
+                        cand_micro_state = "STATIC_GHOST"
+                    elif displacement_mm > config.tuning.macro_displacement_mm:
                         vital_multiplier = 0.9 
                         cand_micro_state = "MACRO_PHASE"
                     elif phase_var > 0.3: 
@@ -441,18 +506,18 @@ class ActivityPipeline:
             is_valid_point = True
             max_mag = max(c['mag'] for c in valid_candidates)
 
-            best_cand, best_score = self._score_candidates(valid_candidates, max_mag, use_tethering=False)
+            best_cand, best_score = self._score_candidates(valid_candidates, max_mag, use_tethering=getattr(self.features, 'tethering', True))
             
             final_peak_bin = best_cand['bin']
             self.current_active_zone = best_cand['zone']
             self.current_micro_state = best_cand.get('micro_state', 'STABLE')
 
             raw_x, raw_y, raw_z = best_cand['x'], best_cand['y'], best_cand['z']
-            raw_z = np.clip(raw_z, 0.05, 1.8)
+            raw_z = np.clip(raw_z, config.tuning.z_clip_min, config.tuning.z_clip_max)
 
-            if self.track_x is not None:
+            if self.track_x is not None and getattr(self.features, 'tethering', True):
                 jump_dist = np.sqrt((raw_x - self.track_x)**2 + (raw_y - self.track_y)**2)
-                if jump_dist > 1.5:  
+                if jump_dist > config.tuning.jump_reject_distance:  
                     is_valid_point = False
                     final_peak_bin = None
                     is_jump = True
@@ -462,6 +527,8 @@ class ActivityPipeline:
         else:
             dynamic_peak_bin = final_peak_bin
 
+        logger.debug("peak_mag=%.1f threshold=%.1f", dynamic_mag_profile[dynamic_peak_bin], self.detection_threshold)
+        
         self.output_dict["Azimuth"] = best_cand['azimuth'] if valid_candidates else 0.0 
         self.output_dict["Elevation"] = best_cand['elevation'] if valid_candidates else 0.0
         self.output_dict["Range"] = dynamic_peak_bin * self.range_res
@@ -478,10 +545,27 @@ class ActivityPipeline:
 
     def _step3_state_machine(self, dynamic_mag_profile, dynamic_peak_bin, raw_x, raw_y, raw_z, is_jump, raw_mag_profile, corrected_data):
         current_threshold = self.detection_threshold if not self.is_occupied else (self.detection_threshold * 0.75)  
-        
         status = self.output_dict.get("status", "")
 
+        if not getattr(self.features, 'apnea_state', True):
+            if not is_jump and dynamic_mag_profile[dynamic_peak_bin] >= self.detection_threshold:
+                self.is_occupied = True
+                self.last_target_bin = dynamic_peak_bin
+                self.last_target_coords = (raw_x, raw_y, raw_z)
+                return {"status": "Occupied (Raw Detection)"}
+            else:
+                self.empty_room()
+                return {"abort": True}
+
+        is_active_target = False
         if not is_jump and dynamic_mag_profile[dynamic_peak_bin] >= self.detection_threshold:
+            if getattr(self.features, 'apnea_state', True):
+                if getattr(self, 'current_micro_state', 'STABLE') not in ["DEAD_SPACE", "STATIC_GHOST"]:
+                    is_active_target = True
+            else:
+                is_active_target = True
+
+        if is_active_target:
             if not self.is_occupied:
                 self.entry_frames += 1
                 if self.entry_frames < self.frames_to_occupy:
@@ -491,6 +575,8 @@ class ActivityPipeline:
             self.apnea_frames = 0
             self.last_target_bin = dynamic_peak_bin   
             self.last_target_coords = (raw_x, raw_y, raw_z)      
+            # Dynamically capture the subject's reflectivity to track them when still
+            self.occupied_reflection = np.max(raw_mag_profile[max(0, dynamic_peak_bin - 1) : min(self.num_range_bins, dynamic_peak_bin + 2)])
             status = "Occupied (Breathing/Moving)"     
         
         elif self.is_occupied and self.last_target_bin is not None:
@@ -501,15 +587,32 @@ class ActivityPipeline:
                 
             last_zone_name, _ = self.evaluate_spatial_zone(curr_loc[0], curr_loc[1], curr_loc[2])
             
+            # Strip sub-zone suffix (e.g. "Bed - Center" -> "Bed") for config lookup
+            base_zone = last_zone_name.split(" - ")[0]
             try:
-                is_monitored_zone = config.layout[last_zone_name]["type"] == "monitor"
+                is_monitored_zone = config.layout[base_zone]["type"] == "monitor"
             except KeyError:
                 is_monitored_zone = False
 
-            current_raw_reflection = np.max(raw_mag_profile[self.last_target_bin - 1 : self.last_target_bin + 2])
-            empty_bed_reflection = self.baseline_profile[self.last_target_bin]
+            current_raw_reflection = np.max(raw_mag_profile[max(0, self.last_target_bin - 1) : min(self.num_range_bins, self.last_target_bin + 2)])
             
-            if is_monitored_zone and current_raw_reflection > (empty_bed_reflection + self.static_margin):
+            # Use dynamic reference instead of static empty room baseline.
+            # If the reflection level drops deeply or phase variance becomes entirely flat (STATIC_GHOST)
+            # they have broken the stillness state and exited the bed.
+            if is_monitored_zone and current_raw_reflection > (getattr(self, 'occupied_reflection', 2000) * 0.70):
+                if getattr(self, 'current_micro_state', 'STABLE') == "STATIC_GHOST":
+                    status = "Empty (Ghost Dropped)"
+                    self.is_occupied = False
+                    self.apnea_frames = 0
+                    self.last_target_bin = None
+                    self.track_confidence = 0
+                    self.coord_buffer.clear()
+                    self.z_history.clear()
+                    self.track_x, self.track_y, self.track_z = None, None, None
+                    self.empty_room()
+                    self.clutter_map = corrected_data.copy()
+                    return {"abort": True}
+                    
                 self.apnea_frames += 1
                 apnea_limit = config.radar.frame_rate * 5 
                 if self.apnea_frames >= apnea_limit:
@@ -534,12 +637,25 @@ class ActivityPipeline:
         return {"status": status, "current_raw_reflection": locals().get('current_raw_reflection', 0.0), "empty_bed_reflection": locals().get('empty_bed_reflection', 0.0)}
 
     def _step4_temporal_persistence(self, is_valid_point, raw_x, raw_y, raw_z):
+        if not getattr(self.features, 'temporal_persistence', True):
+            if is_valid_point:
+                self.track_confidence = self.confidence_threshold
+                self.coord_buffer = deque([(raw_x, raw_y, raw_z)], maxlen=self.buffer_size)
+                return {}
+            else:
+                self.is_occupied = False
+                self.last_target_bin = None
+                self.track_confidence = 0
+                self.coord_buffer.clear()
+                self.z_history.clear()
+                self.track_x, self.track_y, self.track_z = None, None, None
+                self.empty_room()
+                return {"abort": True}
+
         if is_valid_point:
             self.track_confidence = min(self.track_confidence + 1, self.confidence_threshold)
             self.miss_counter = 0
             self.coord_buffer.append((raw_x, raw_y, raw_z))
-            if len(self.coord_buffer) > self.buffer_size:
-                self.coord_buffer.pop(0)
         else:
             self.miss_counter += 1
             if self.miss_counter > self.miss_allowance:
@@ -555,10 +671,17 @@ class ActivityPipeline:
 
     def _step5_adaptive_smoothing(self):
         if self.track_confidence >= self.confidence_threshold:
-            recent_coords = np.array(self.coord_buffer)
+            recent_coords = np.array(list(self.coord_buffer))
             med_x = np.median(recent_coords[:, 0])
             med_y = np.median(recent_coords[:, 1])
             med_z = np.median(recent_coords[:, 2])
+
+            if not getattr(self.features, 'adaptive_smoothing', True):
+                self.track_x, self.track_y, self.track_z = med_x, med_y, med_z
+                self.motion_level = 0.5
+                X_b, Y_b, Z_b = med_x, med_y, med_z  
+                v_z = 0.0
+                return {"X_b": X_b, "Y_b": Y_b, "Z_b": Z_b, "v_z": v_z}
 
             if self.track_x is None:
                 self.track_x, self.track_y, self.track_z = med_x, med_y, med_z
@@ -571,26 +694,36 @@ class ActivityPipeline:
                 candidate_zone = self.current_active_zone  
                 if track_zone != candidate_zone:
                     adaptive_alpha = 0.4
+                    # Flush buffer on zone transition so median catches up immediately
+                    recent = list(self.coord_buffer)[-3:] if len(self.coord_buffer) >= 3 else list(self.coord_buffer)
+                    self.coord_buffer.clear()
+                    for c in recent:
+                        self.coord_buffer.append(c)
+                elif shift_distance > 0.50:
+                    adaptive_alpha = 0.5
+                    # Large movement: trim buffer to recent frames for faster median response
+                    recent = list(self.coord_buffer)[-5:] if len(self.coord_buffer) >= 5 else list(self.coord_buffer)
+                    self.coord_buffer.clear()
+                    for c in recent:
+                        self.coord_buffer.append(c)
                 elif shift_distance < 0.12:
                     adaptive_alpha = 0.02  
-                elif shift_distance < 0.50:
-                    adaptive_alpha = 0.1   
                 else:
-                    adaptive_alpha = 0.5   
+                    adaptive_alpha = 0.1   
                 
                 self.track_x = (adaptive_alpha * med_x) + ((1 - adaptive_alpha) * self.track_x)
                 self.track_y = (adaptive_alpha * med_y) + ((1 - adaptive_alpha) * self.track_y)
                 self.track_z = (adaptive_alpha * med_z) + ((1 - adaptive_alpha) * self.track_z)
 
-            X_b, Y_b, Z_b = med_x, med_y, med_z  
+            # Use the smoothed track as output (responsive to movement via adaptive alpha)
+            X_b, Y_b, Z_b = self.track_x, self.track_y, self.track_z
 
             self.z_history.append(Z_b)
-            if len(self.z_history) > self.z_history_size:  
-                self.z_history.pop(0)
                 
             velocity_window_frames = int(config.radar.frame_rate * 0.4) 
             if len(self.z_history) >= velocity_window_frames:
-                dz = self.z_history[-1] - self.z_history[-velocity_window_frames]
+                z_list = list(self.z_history)
+                dz = z_list[-1] - z_list[-velocity_window_frames]
                 dt = velocity_window_frames * (1.0 / config.radar.frame_rate) 
                 v_z = dz / dt  
             else:
@@ -601,25 +734,16 @@ class ActivityPipeline:
             self.empty_room()
             return {"abort": True}
 
-    def _step6_posture_and_motion(self, X_b, Y_b, Z_b, status):
+    def _step6_posture_and_motion(self, X_b, Y_b, Z_b, v_z, status):
         final_zone, _ = self.evaluate_spatial_zone(X_b, Y_b, Z_b)
 
         self.zone_history.append(final_zone)
-        if len(self.zone_history) > self.frames_to_confirm_zone:
-            self.zone_history.pop(0)
 
         if len(self.zone_history) == self.frames_to_confirm_zone:
-            most_common_zone = max(set(self.zone_history), key=self.zone_history.count)
+            most_common_zone = Counter(self.zone_history).most_common(1)[0][0]
             self.current_stable_zone = most_common_zone
             
-        final_zone = self.current_stable_zone
-
-        if Z_b > config.posture.standing_threshold:
-            posture = "Standing"
-        elif Z_b > config.posture.sitting_threshold:
-            posture = "Sitting"
-        else:
-            posture = "Lying Down"
+        final_zone = getattr(self, 'current_stable_zone', final_zone)
 
         if "Apnea" in status:
             motion_str = "Static"
@@ -633,6 +757,20 @@ class ActivityPipeline:
             motion_str = "Restless/Fidgeting"
         else:
             motion_str = "Resting/Breathing"
+
+        if not getattr(self.features, 'fall_posture', True):
+            if final_zone in ["Out of Bounds (Ghost)", "Ignored"]:
+                self.is_occupied = False
+                self.last_target_bin = None
+                return {"abort": True}
+            return {"final_zone": final_zone, "posture": "Unknown", "motion_str": motion_str, "status": status, "fall_confidence": 0.0}
+
+        if Z_b > config.posture.standing_threshold:
+            posture = "Standing"
+        elif Z_b > config.posture.sitting_threshold:
+            posture = "Sitting"
+        else:
+            posture = "Lying Down"
         
         fall_confidence = 0.0
         
@@ -643,14 +781,24 @@ class ActivityPipeline:
             
         elif final_zone == "Floor / Transit":
             status = status.replace("Occupied", "In the Room") 
+
+            # Rapid-descent velocity trigger (catches the moment of fall)
+            if v_z < self.fall_velocity_threshold and not self.is_fallen:
+                self.is_fallen = True
+                self.fall_persistence_frames = 0
+                logger.warning("Rapid descent detected: v_z=%.2f m/s (threshold=%.2f)", v_z, self.fall_velocity_threshold)
+
             if Z_b <= self.fall_threshold_z or self.is_fallen:
                 self.is_fallen = True
                 self.fall_persistence_frames += 1
                 
                 h_score = max(0.0, (self.fall_threshold_z - Z_b) / self.fall_threshold_z) * 100.0
                 p_score = min(100.0, (self.fall_persistence_frames / self.z_history_size) * 100.0) 
+
+                # Velocity component: a rapid drop boosts confidence immediately
+                v_score = min(100.0, max(0.0, abs(v_z) / abs(self.fall_velocity_threshold)) * 100.0) if v_z < 0 else 0.0
                 
-                fall_confidence = (0.4 * h_score) + (0.6 * p_score)
+                fall_confidence = (0.3 * h_score) + (0.4 * p_score) + (0.3 * v_score)
                 
                 if fall_confidence > 60.0:
                     status = "CRITICAL: Fall Detected!"
@@ -673,9 +821,11 @@ class ActivityPipeline:
             if self.motion_level > 0.05:
                 signal_conf = 100.0 
         elif "Apnea" in status:
-            margin = (current_raw_reflection - empty_bed_reflection - self.static_margin) / self.static_margin
+            occupied = getattr(self, 'occupied_reflection', 2000)
+            threshold = occupied * 0.70
+            margin = (current_raw_reflection - threshold) / (occupied - threshold + 1e-6)
             if margin <= 0: margin = 0
-            signal_conf = min(100.0, 50.0 + (margin * 100.0))
+            signal_conf = min(100.0, 50.0 + (margin * 50.0))
             
         occ_confidence = (0.6 * temporal_conf) + (0.4 * signal_conf)
         if self.miss_counter > 0:
@@ -720,14 +870,14 @@ class ActivityPipeline:
         s5 = self._step5_adaptive_smoothing()
         if s5.get("abort"): return self.output_dict
 
-        # Step 6: Posture Logic & Motion Tagging
-        s6 = self._step6_posture_and_motion(s5["X_b"], s5["Y_b"], s5["Z_b"], s3["status"])
+        # Step 6: Posture Logic & Motion Tagging (now receives v_z for fall detection)
+        s6 = self._step6_posture_and_motion(s5["X_b"], s5["Y_b"], s5["Z_b"], s5["v_z"], s3["status"])
         if s6.get("abort"): return self.output_dict
 
         # Step 7: Confidence Indices
         s7 = self._step7_confidence_metrics(
             s6["status"], s1["dynamic_mag_profile"], s2["dynamic_peak_bin"], 
-            s3["current_raw_reflection"], s3["empty_bed_reflection"], 
+            s3.get("current_raw_reflection", 0.0), s3.get("empty_bed_reflection", 0.0), 
             s5["Z_b"], s6["posture"]
         )
 
@@ -738,6 +888,9 @@ class ActivityPipeline:
         duration_str = "--"
         if self.zone_timer_zone is not None and self.zone_timer_start is not None:
             duration_str = self._format_duration(now - self.zone_timer_start)
+
+        # Build ordered spectral history for downstream consumers (respiration pipeline)
+        ordered_spectral = self._get_ordered_history(self.spectral_history, self._ring_idx_spectral, self.spectral_frames)
 
         # Finalize Output
         self.output_dict.update({
@@ -753,6 +906,7 @@ class ActivityPipeline:
             "motion_str": s6["motion_str"],
             "duration_str": duration_str,
             "fall_confidence": s6["fall_confidence"],
-            "spectral_history": self.spectral_history,
+            "spectral_history": ordered_spectral,
+            "is_valid": True,
         })
         return self.output_dict

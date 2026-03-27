@@ -1,30 +1,25 @@
 graph TD
-    subgraph "Step 4: Outlier Rejection (Teleportation Guard)"
-        Input4["<b>Input:</b> raw_x, raw_y, smoothed_x, smoothed_y,<br/>is_valid_point, status"] --> CondTele{"Point Valid?<br/>Track Exists?<br/>Not Apnea state?"}
-
-        CondTele -- Yes --> CalcJump[Calculate horizontal jump distance]
-        CalcJump --> JumpGate{"Jump > 1.5m?"}
-        JumpGate -- Yes --> Reject["is_valid_point = False"]
-        JumpGate -- No --> OutputValid["Update is_valid_point"]
-        CondTele -- No --> OutputValid
-    end
-    
-    OutputValid --> Input5["<b>Input:</b> updated is_valid_point,<br/>track_confidence, miss_counter"]
-    
-    subgraph "Step 5: Temporal Persistence (Hit/Miss Tracking)"
-        Input5 --> DecVal{"Point Valid?"}
+    subgraph "Step 4: Temporal Persistence (Hit/Miss Tracking)"
+        Input4["<b>Input:</b> is_valid_point, raw_x/y/z,<br/>track_confidence, miss_counter"] --> CheckFeat{"temporal_persistence<br/>feature enabled?"}
         
-        DecVal -- Yes --> Hit["Increment track_confidence<br/>(cap threshold)<br/>miss_counter = 0"]
-        Hit --> BuffCoord["Push (raw_x,y,z) to coord_buffer (FIFO)"]
+        CheckFeat -- No --> RawValid{"Point Valid?"}
+        RawValid -- Yes --> RawSet["Set confidence = threshold,<br/>coord_buffer = deque with point"]
+        RawValid -- No --> RawLost["Clear state, empty_room(), abort"]
+        RawSet --> Output4["<b>Proceed to Step 5</b>"]
+        
+        CheckFeat -- Yes --> DecVal{"Point Valid?"}
+        
+        DecVal -- Yes --> Hit["Increment track_confidence<br/>(capped at threshold)<br/>miss_counter = 0"]
+        Hit --> BuffCoord["Append (raw_x,y,z) to<br/>coord_buffer (deque, maxlen=buffer_size)<br/>O(1) append, auto-evicts oldest"]
         
         DecVal -- No --> Miss["Increment miss_counter"]
-        Miss --> MissGate{"miss_counter > <br/>Miss Allowance?"}
-        MissGate -- Yes --> TargetLost["Reset occupation state (False)<br/>Clear tracks, buffers, history"]
-        TargetLost --> CallEmpty["Call empty_room()<br/>Exit process_frame"]
+        Miss --> MissGate{"miss_counter ><br/>miss_allowance?"}
+        MissGate -- Yes --> TargetLost["Reset occupation state<br/>Clear tracks, deque buffers"]
+        TargetLost --> CallEmpty["empty_room(), abort"]
         
-        BuffCoord --> TrackCheck{"Track Confidence >= <br/>Confidence Threshold?"}
+        BuffCoord --> TrackCheck{"track_confidence >=<br/>confidence_threshold?"}
         MissGate -- No --> TrackCheck
         
-        TrackCheck -- Yes --> Output5["<b>Proceed to Step 6</b>"]
+        TrackCheck -- Yes --> Output4
         TrackCheck -- No --> CallEmpty
     end

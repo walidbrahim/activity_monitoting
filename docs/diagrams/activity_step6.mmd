@@ -1,36 +1,37 @@
 graph TD
-    Input6["<b>Input:</b> coord_buffer, smoothed_x,y,z,<br/>MotionLevel, z_history, ZoneMismatch status"] --> MedFilt
+    Input5["<b>Input:</b> coord_buffer (deque), track_x/y/z,<br/>motion_level, current_active_zone"] --> MedFilt
     
     subgraph "Median Filtering"
-        MedFilt["<b>Apply Median Filter</b> across coord_buffer FIFO<br/>Extract Med_X, Med_Y, Med_Z"]
+        MedFilt["<b>Apply Median Filter</b> across coord_buffer deque<br/>Extract Med_X, Med_Y, Med_Z"]
     end
     
     subgraph "Adaptive Smoothing EMA"
-        MedFilt --> TrackExist["Smoothed Track exists?"]
-        TrackExist -- No --> InitTrack["smoothed_x,y,z = Median X,Y,Z<br/>MotionLevel = 0.0"]
-        TrackExist -- Yes --> CalcShift["Calculate Shift Distance (Med vs Track)"]
+        MedFilt --> TrackExist{"Smoothed Track<br/>exists?"}
+        TrackExist -- No --> InitTrack["track_x/y/z = Median X,Y,Z<br/>motion_level = 0.0"]
+        TrackExist -- Yes --> CalcShift["Calculate Shift Distance<br/>(Median vs current Track)"]
         
-        CalcShift --> UpdateAct["<b>Update MotionLevel EMA</b><br/>0.2 * Shift + 0.8 * OldMotion"]
+        CalcShift --> UpdateAct["<b>Update motion_level EMA</b><br/>0.2 * shift + 0.8 * old_motion"]
         
-        UpdateAct --> ZoneMismatch{"Zone Mismatch (Track vs BestCand)?"}
-        ZoneMismatch -- Yes --> AggAlpha["Alpha = 0.4 (Aggressive to catch up)"]
+        UpdateAct --> ZoneMismatch{"Zone Mismatch?<br/>(track_zone != candidate_zone)"}
+        ZoneMismatch -- Yes --> AggAlpha["alpha = 0.4<br/>(Aggressive to catch up)"]
         
-        ZoneMismatch -- No --> SpeedGate{"Shift < 0.12m (Breathing)?<br/>Else Shift < 0.5m (Glide)?"}
-        SpeedGate -- Breathing --> FreezeAlpha["Alpha = 0.02 (Freeze UI dot)"]
-        SpeedGate -- Glide --> SmoothAlpha["Alpha = 0.1 (Smooth glide)"]
-        SpeedGate -- High Speed --> FailAlpha["Alpha = 0.5 (Failsafe)"]
+        ZoneMismatch -- No --> SpeedGate{"shift < 0.12m?"}
+        SpeedGate -- Yes --> FreezeAlpha["alpha = 0.02<br/>(Freeze, breathing mode)"]
+        SpeedGate -- No --> MedGate{"shift < 0.50m?"}
+        MedGate -- Yes --> SmoothAlpha["alpha = 0.1<br/>(Smooth glide)"]
+        MedGate -- No --> FailAlpha["alpha = 0.5<br/>(Failsafe, rapid catch-up)"]
         
-        AggAlpha --> UpdateCoord["Update Smoothed Track EMA using Alpha"]
+        AggAlpha --> UpdateCoord["Update track_x/y/z via EMA"]
         FreezeAlpha --> UpdateCoord
         SmoothAlpha --> UpdateCoord
         FailAlpha --> UpdateCoord
     end
     
-    subgraph "Z-History & Velocity (Actigraphy)"
-        InitTrack --> PushZ["Push Z to z_history FIFO"]
+    subgraph "Z-History & Velocity"
+        InitTrack --> PushZ["Append Z_b to z_history<br/>(deque, maxlen=50, O(1))"]
         UpdateCoord --> PushZ
         
-        PushZ --> CalcV["<b>Calculate Vertical Velocity (v_z)</b><br/>(z_history[end] - z_history[start]) / history duration"]
+        PushZ --> CalcV["<b>Calculate Vertical Velocity (v_z)</b><br/>v_z = (z[-1] - z[-window]) / dt<br/>window = 0.4s worth of frames"]
     end
     
-    CalcV --> OutputCoord["<b>Output:</b> Smoothed X,Y,Z (Final Coords),<br/>motion_level, v_z"]
+    CalcV --> OutputCoord["<b>Output:</b> X_b, Y_b, Z_b (median coords),<br/>motion_level, v_z"]

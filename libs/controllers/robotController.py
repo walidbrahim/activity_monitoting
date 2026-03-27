@@ -11,6 +11,7 @@ except ImportError:
 class RobotController(threading.Thread):
     def __init__(self):
         super().__init__()
+        from config import config
         self.arm = None
         self.enabled = USE_ROBOT
         self.running = False

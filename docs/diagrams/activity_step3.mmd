@@ -1,33 +1,39 @@
 graph TD
-    Input["<b>Input:</b> current peak bin, raw/dyn mag profiles,<br/>baseline profile, is_occupied status"] --> DynCheck
+    Input["<b>Input:</b> dynamic_mag_profile, peak_bin,<br/>raw_x/y/z, is_jump, raw_mag_profile,<br/>corrected_data, is_occupied"] --> CheckFeature{"apnea_state<br/>feature enabled?"}
     
-    DynCheck{"Is Dynamic Mag >= <br/>Detection Threshold?"}
+    CheckFeature -- No --> RawMode{"Dynamic Mag >=<br/>Detection Threshold?"}
+    RawMode -- Yes --> RawOcc["is_occupied=True<br/>status=Occupied (Raw Detection)"]
+    RawMode -- No --> EmptyRaw["empty_room(), abort"]
     
-    DynCheck -- Yes --> S1["    <b>STATE: Active/Breathing</b>"]
-    S1 --> S1_Set["is_occupied=True,<br/>status=Occupied (Breathing/Moving)"]
-    S1_Set --> OutputMachine["<b>Output:</b> status,<br/>updated raw x,y,z if Apnea"]
+    CheckFeature -- Yes --> DynCheck{"Dynamic Mag >= Threshold<br/>AND not is_jump<br/>AND micro_state not<br/>DEAD_SPACE/STATIC_GHOST?"}
     
-    DynCheck -- No --> ApneaGate{"Is Room Occupied?<br/>Is previous bin known?"}
+    DynCheck -- Yes --> EntryGate{"Already occupied?"}
+    EntryGate -- Yes --> S1_Active["<b>STATE: Active/Breathing</b><br/>apnea_frames = 0<br/>Capture occupied_reflection"]
+    EntryGate -- No --> EntryHold{"entry_frames <<br/>frames_to_occupy?"}
+    EntryHold -- Yes --> AbortEntry["Still warming entry, abort"]
+    EntryHold -- No --> S1_Active
+    S1_Active --> OutputMachine
     
-    ApneaGate -- Yes --> CheckStill["Calculate Diff = Raw - Baseline at old bin"]
-    ApneaGate -- No --> S4["<b>STATE: Truly Empty</b>"]
+    DynCheck -- No --> ApneaGate{"is_occupied AND<br/>last_target_bin known?"}
+    ApneaGate -- No --> S4["<b>STATE: Truly Empty</b><br/>empty_room(), abort"]
     
-    CheckStill --> StillGate{"Is Diff > <br/>Static Margin?"}
-    StillGate -- Yes --> S2["<b>STATE: Stillness/Apnea</b>"]
-    S2 --> CheckTrack{"Smoothed Track Exists?"}
-    CheckTrack -- Yes --> S2_UseTrack["raw x,y,z = Smoothed Track Coords"]
-    CheckTrack -- No --> S2_Buffer{"Coords in Buffer?"}
-    S2_Buffer -- Yes --> S2_UseBuff["raw x,y,z = Last Buffered Coords"]
-    S2_Buffer -- No --> ExitState
-    S2_UseTrack --> S2_SetStatus["status=Still / Possible Apnea"]
-    S2_UseBuff --> S2_SetStatus
-    S2_SetStatus --> OutputMachine
+    ApneaGate -- Yes --> GetZone["Get last known position zone"]
+    GetZone --> StripZone["<b>Strip sub-zone suffix</b><br/>base_zone = zone.split(' - ')[0]<br/>(e.g. 'Bed - Center' → 'Bed')"]
+    StripZone --> LookupType["config.layout[base_zone].type == 'monitor'?"]
     
-    StillGate -- No --> S3["<b>STATE: Confirmed Exit</b>"]
-    S3 --> ExitActions["Clear state (is_occupied=False,<br/>clear tracks, clear history)"]
-    ExitActions --> LearnEmpty["<b>Snapshot Raw to Baseline</b><br/>(Forces re-calibration on empty state)"]
-    LearnEmpty --> ExitEmpty
-    ExitState --> LearnEmpty
-    S4 --> ExitEmpty
+    LookupType -- "Not Monitor" --> ExitState["<b>STATE: Confirmed Exit</b><br/>Clear state, snapshot clutter map,<br/>empty_room(), abort"]
     
-    ExitEmpty["Call empty_room()<br/>Exit process_frame"]
+    LookupType -- Monitor --> ReflCheck{"current_raw_reflection ><br/>occupied_reflection * 0.70?"}
+    ReflCheck -- No --> ExitState
+    
+    ReflCheck -- Yes --> GhostCheck{"micro_state ==<br/>STATIC_GHOST?"}
+    GhostCheck -- Yes --> GhostDrop["<b>STATE: Ghost Dropped</b><br/>Static reflection with no vital signs.<br/>Clear state, snapshot clutter, abort"]
+    
+    GhostCheck -- No --> ApneaCount["Increment apnea_frames"]
+    ApneaCount --> ApneaLimit{"apnea_frames >=<br/>frame_rate * 5?"}
+    ApneaLimit -- Yes --> S2_Apnea["status = Possible Apnea"]
+    ApneaLimit -- No --> S2_Still["status = Still / Monitoring..."]
+    
+    S2_Apnea --> OutputMachine["<b>Output:</b> status,<br/>current_raw_reflection"]
+    S2_Still --> OutputMachine
+    RawOcc --> OutputMachine
