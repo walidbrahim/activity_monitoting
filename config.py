@@ -81,6 +81,15 @@ class TuningConfig(BaseModel):
     warmup_seconds: float = 1.0
     entry_hold_seconds: float = 3.0
     reassess_seconds: float = 3.0
+    # Aliveness Check: Layer 1 — SNR Floor
+    min_person_snr: float = 80.0
+    # Aliveness Check: Layer 2 — Position Stability
+    position_stability_window: int = 75
+    max_clutter_position_var: float = 0.08
+    # Aliveness Check: Layer 3 — Multi-Metric Spectral Quality
+    aliveness_threshold: float = 0.40
+    breathing_displacement_min: float = 0.5
+    breathing_displacement_max: float = 12.0
 
 class AppFlagsConfig(BaseModel):
     log_level: int

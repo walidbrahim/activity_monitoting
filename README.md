@@ -1,48 +1,60 @@
-# 🏠 Room Activity & Occupancy Monitoring 
+# 🏠 Advanced Room Activity & Occupancy Monitoring 
 
-An application for real-time monitoring of indoor presence and activity using 60GHz mmWave radar datasets (e.g., TI IWR6843). It supports layout geofencing, background clutter noise rejection, and vital estimation for breathing validation.
+An industrial-grade real-time monitoring application for indoor presence and activity using 60GHz mmWave radar (e.g., TI IWR6843). Features a high-performance **PyQt6/PyQtGraph** dashboard, multi-layered aliveness checks, and precise chest-focus vital signs tracking.
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Key Features
+
+*   🎯 **Precision Targeting**: Intelligent scoring prioritizes the occupant's chest/torso for optimal vital signs extraction.
+*   🛡️ **3-Layer Aliveness Check**: Mitigates false positives from mechanical clutter (fans, curtains) using SNR floors, spatial stability tracking, and multi-metric spectral analysis (Prominence, Autocorr, Entropy).
+*   📊 **Premium Dashboard**: Real-time visualization of breathing signals, respiration rates, radar maps, and occupancy trends with a modern dark theme and glassmorphism UI.
+*   🗺️ **Smart Geofencing**: Support for custom zones (Bed, Chair, Transit) with dynamic color-temperature feedback based on occupancy confidence.
+*   📉 **Advanced Vitals**: High-accuracy respiration and heart rate monitoring (placeholder) with trend analysis.
+
+---
+
+## 🛠️ Quick Start
 
 ### 1. Prerequisites
-Ensure you have a virtual environment set up and activated with the necessary dependencies:
+Ensure you have Python 3.9+ and a virtual environment set up:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install numpy scipy matplotlib pyserial requests
+pip install pyqt6 pyqtgraph pydantic-settings pyserial pyyaml scipy numpy
 ```
 
 ### 2. Run the App
-Launch using your virtual environment interpreter:
+Launch the main dashboard:
 ```bash
-venv/bin/python3 room_occupancy_app.py
+python3 main.py
 ```
 
 ---
 
-## 🛠️ Project Structure
+## 📂 Project Structure
 
-*   📅 **`room_occupancy_app.py`**: Main controller and visualization pipeline including subprocess runners.
-*   📂 **`docs/diagrams/`**: Contains processing pipeline Mermaid step flowcharts:
-    *   `activity_step1.mmd`: Hardware calibration and background clutter subtractions.
-    *   `activity_step2.mmd`: Spatial projection to 3D room coords & vital sign gating.
-    *   `activity_step3.mmd`: State machine (Occupied, Apnea, Stillness, Empty).
-    *   `activity_step6.mmd`: Adaptive smoothing EMA & Coordinate actigraphy index rates.
-    *   `activity_step7.mmd`: Critical fall detection logic thresholds.
-    *   `activity_step8_9.mmd`: Confidence weights index generation.
+*   🏗️ **`main.py`**: Application entry point and thread management.
+*   🧠 **`libs/pipelines/`**: Core processing logic (Spatial Projection, Aliveness, State Machine).
+*   🎨 **`libs/gui/`**: High-performance PyQt6 dashboard implementation.
+*   ⚙️ **`config.py`**: Pydantic-based configuration system.
+*   📄 **`profiles/`**: YAML-based application and environment profiles.
+*   🔌 **`libs/controllers/`**: Hardware interfaces for Radar and xArm.
 
 ---
 
-## 🍏 MacOS Specific Setup
-If you are running on a Macbook:
+## 🍎 MacOS Specifics
 
-### Finding Serial Ports
-Run this snippet to identify the radar controller interface:
+### Serial Port Identification
+Identify the radar's CLI and Data ports:
 ```bash
-ls /dev/cu.* | grep -E 'usb|SLAB|modem|serial'
+ls /dev/cu.usbserial*
 ```
 
-### Display Backend
-The application automatically selects the `MacOSX` backend to avoid standard `Tkinter` installation aborts (`macOS 26 requires`). Setup will fall back to `TkAgg` on Linux servers perfectly without any manual adjustments.
+### Performance
+The application uses **PyQt6** for a native, hardware-accelerated experience on macOS. Ensure no other application is holding the serial ports before launching.
+
+---
+
+## 🔧 Tuning
+thresholds and parameters for filters, aliveness checks, and zone boundaries can be adjusted in `profiles/app_config.yaml`. Enable `DEBUG` log level in the config to see detailed per-frame spectral quality metrics.

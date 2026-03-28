@@ -21,9 +21,9 @@ layout:
     margin_y: [0.3, 0.0]
     arm_move: [500, 500, 200, 500, 500, 300] # motor positions
     radar_pose:
-      x: 1.15
-      y: 3.27
-      z: 1.0
+      x: 1.2
+      y: 3.5
+      z: 0.95
       yaw_deg: 210
       pitch_deg: -35
       fov_deg: 120
@@ -111,21 +111,21 @@ respiration:
 app:
   log_level: 10
   need_send_ti_config: true
-  send_alert: false
+  send_alert: true
   enable_robot_arm: false
   default_radar_pose: "Bed"
 
 gui_theme:
-  fig_bg: "#111827"
-  panel_bg: "#1F2937"
-  card_bg: "#243447"
-  card_ok: "#166534"
-  card_warn: "#92400E"
-  card_alert: "#7F1D1D"
+  fig_bg: "#0F172A"
+  panel_bg: "#1E1B4B"
+  card_bg: "#1E293B"
+  card_ok: "#059669"
+  card_warn: "#D97706"
+  card_alert: "#DC2626"
   text: "#E5E7EB"
   subtext: "#9CA3AF"
   grid: "#334155"
-  bed: "#4A90E2"
+  bed: "#6366F1"
   chair: "#14B8A6"
   monitor: "#6B8E7A"
   ignore: "#DC2626"
@@ -146,3 +146,12 @@ tuning:
   warmup_seconds: 1.0
   entry_hold_seconds: 3.0
   reassess_seconds: 3.0
+  # Aliveness Check: Layer 1 — SNR Floor
+  min_person_snr: 80.0
+  # Aliveness Check: Layer 2 — Position Stability
+  position_stability_window: 75
+  max_clutter_position_var: 0.08
+  # Aliveness Check: Layer 3 — Multi-Metric Spectral Quality
+  aliveness_threshold: 0.40
+  breathing_displacement_min: 0.5
+  breathing_displacement_max: 12.0

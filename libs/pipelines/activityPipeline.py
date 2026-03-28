@@ -94,6 +94,9 @@ class ActivityPipeline:
         self._ring_idx_complex = 0
         self._ring_idx_spectral = 0
 
+        # Aliveness Check: Layer 2 — Position Stability
+        self._pos_history = deque(maxlen=config.tuning.position_stability_window)
+
         self.output_dict = {}
         self.apnea_frames = 0
         self.entry_frames = 0
@@ -132,6 +135,98 @@ class ActivityPipeline:
             return history
         return np.concatenate([history[:, idx:], history[:, :idx]], axis=1)
 
+    def _compute_aliveness(self, cand_phase, cand_bin):
+        """
+        Multi-metric aliveness score (Layer 3).
+        Returns (aliveness_score: float [0–1], micro_state: str).
+        """
+        # --- Shared pre-computation ---
+        detrended = signal.detrend(cand_phase)
+        window = np.hanning(len(detrended))
+        windowed = detrended * window
+        fft_result = np.fft.rfft(windowed)
+        fft_mag = np.abs(fft_result)
+        freqs = np.fft.rfftfreq(len(detrended), d=(1.0 / config.radar.frame_rate))
+
+        vital_mask = (freqs >= 0.15) & (freqs <= 0.7)
+        eval_mask = (freqs >= 0.15) & (freqs <= 3.0)
+
+        vital_fft = fft_mag[vital_mask]
+        eval_fft = fft_mag[eval_mask]
+
+        if len(vital_fft) == 0 or len(eval_fft) == 0 or np.sum(eval_fft) < 1e-9:
+            return 0.0, "DEAD_SPACE"
+
+        # --- Metric 1: Peak Prominence ---
+        # A real breathing peak stands clearly above the noise floor
+        peak_power = np.max(vital_fft)
+        median_power = np.median(eval_fft) + 1e-9
+        raw_prominence = peak_power / median_power
+        # Normalize: prominence of 5+ → score 1.0, below 1.5 → score 0.0
+        prominence_score = np.clip((raw_prominence - 1.5) / (5.0 - 1.5), 0.0, 1.0)
+
+        # --- Metric 2: Autocorrelation Quality ---
+        # Real breathing is self-similar; clutter is not
+        norm_signal = detrended - np.mean(detrended)
+        autocorr = np.correlate(norm_signal, norm_signal, mode='full')
+        autocorr = autocorr[len(autocorr) // 2:]  # keep positive lags only
+        if autocorr[0] > 1e-9:
+            autocorr = autocorr / autocorr[0]  # normalize
+        else:
+            autocorr = np.zeros_like(autocorr)
+        # Look for a peak in the breathing lag range (1.4s – 6.7s = 9–36 BPM)
+        min_lag = int(1.4 * config.radar.frame_rate)  # ~35 frames at 25fps
+        max_lag = int(6.7 * config.radar.frame_rate)  # ~167 frames
+        max_lag = min(max_lag, len(autocorr) - 1)
+        if min_lag < max_lag:
+            autocorr_peak = np.max(autocorr[min_lag:max_lag])
+        else:
+            autocorr_peak = 0.0
+        # Normalize: autocorr peak of 0.3+ → score 1.0, below 0.05 → score 0.0
+        autocorr_score = np.clip((autocorr_peak - 0.05) / (0.3 - 0.05), 0.0, 1.0)
+
+        # --- Metric 3: Displacement Amplitude ---
+        # Real chest wall: 0.5–12mm; clutter is often outside this range
+        phase_ptp = np.ptp(cand_phase)
+        displacement_mm = (phase_ptp * 5.0) / (4.0 * np.pi)  # λ/2 for 60GHz
+        if config.tuning.breathing_displacement_min <= displacement_mm <= config.tuning.breathing_displacement_max:
+            amplitude_score = 1.0
+        else:
+            # Gradual falloff outside the valid range
+            if displacement_mm < config.tuning.breathing_displacement_min:
+                amplitude_score = np.clip(displacement_mm / config.tuning.breathing_displacement_min, 0.0, 1.0)
+            else:
+                # Over the max — likely mechanical motion
+                amplitude_score = np.clip(1.0 - (displacement_mm - config.tuning.breathing_displacement_max) / 20.0, 0.0, 1.0)
+
+        # --- Metric 4: Spectral Entropy ---
+        # Low entropy = peaky spectrum (biological), high entropy = flat/spread (noise/clutter)
+        p = eval_fft / (np.sum(eval_fft) + 1e-9)
+        p = p[p > 1e-12]  # avoid log(0)
+        entropy = -np.sum(p * np.log(p))
+        max_entropy = np.log(len(eval_fft))  # uniform distribution entropy
+        normalized_entropy = entropy / (max_entropy + 1e-9)
+        # Invert: low entropy → high score
+        entropy_score = np.clip(1.0 - normalized_entropy, 0.0, 1.0)
+
+        # --- Combined Aliveness Score ---
+        aliveness = (0.30 * prominence_score) + (0.30 * autocorr_score) + (0.20 * amplitude_score) + (0.20 * entropy_score)
+
+        logger.debug(
+            "Aliveness bin=%d: prom=%.2f autocorr=%.2f ampl=%.2f(%.1fmm) entropy=%.2f → %.2f",
+            cand_bin, prominence_score, autocorr_score, amplitude_score, displacement_mm, entropy_score, aliveness
+        )
+
+        # Determine micro state from the aliveness score
+        if aliveness >= config.tuning.aliveness_threshold:
+            micro_state = "ALIVE"
+        elif aliveness >= config.tuning.aliveness_threshold * 0.5:
+            micro_state = "WEAK_VITAL"
+        else:
+            micro_state = "DEAD_SPACE"
+
+        return aliveness, micro_state
+
     def _score_candidates(self, candidates, max_mag, use_tethering):
         best, best_s = None, -float('inf')
         
@@ -149,17 +244,18 @@ class ActivityPipeline:
                 track_in_monitor = True
 
         for c in candidates:
-            # Base score: heavily normalize the magnitude so it doesn't overpower vitals
+            # Base score: vital quality always prioritized over raw magnitude
+            # to naturally gravitate toward the chest (strongest breathing signal)
             mag_ratio = c['mag'] / max_mag
             
-            # --- 1. VITAL OVERRIDE (Focus on the Chest) ---
+            # --- 1. VITAL-DOMINANT SCORING (Focus on the Chest) ---
             if track_in_monitor:
-                # If they are in bed, we don't care how "loud" the reflection is.
-                # We care almost exclusively about how rhythmic it is.
-                s = (mag_ratio * 0.2) + (c['vital_mult'] * 2.0) 
+                # Bed mode: almost exclusively care about rhythmic breathing quality
+                s = (mag_ratio * 0.1) + (c['vital_mult'] * 2.5) 
             else:
-                # Standard scoring for walking around the room
-                s = mag_ratio * c['vital_mult']
+                # Standard mode: still prioritize vital quality over raw magnitude
+                # so the chest wins over brighter but non-breathing reflectors
+                s = (mag_ratio * 0.3) + (c['vital_mult'] * 1.5)
             
             # Zone preference bonus   # TODO: make it relative to the zone type not the name
             if c['zone'] not in ('Floor / Transit', 'Out of Bounds (Ghost)'):
@@ -214,11 +310,13 @@ class ActivityPipeline:
         self.spectral_history.fill(0)
         self._ring_idx_complex = 0
         self._ring_idx_spectral = 0
+        self._pos_history.clear()
         self.frame_count = 0  
 
     def empty_room(self):
         self.motion_level = 0.0
         self.current_micro_state = "STABLE"
+        self._pos_history.clear()
         self.output_dict = {
             "X": None,
             "Y": None,
@@ -438,12 +536,16 @@ class ActivityPipeline:
                             cand_range * np.sin(el_cand)])
             Pb_c = np.dot(self.R, Pr_c) + self.T
             
+            # === Layer 1: SNR Magnitude Floor ===
+            if dynamic_mag_profile[cand_bin] < config.tuning.min_person_snr:
+                continue  # Too weak to be a person — skip entirely
+
             zone_name, is_valid = self.evaluate_spatial_zone(Pb_c[0], Pb_c[1], Pb_c[2])
             if is_valid and zone_name != "Out of Bounds (Ghost)":
                 cand_micro_state = "STABLE"
                 vital_multiplier = 0.1
                 
-                # Aliveness check
+                # === Aliveness check (Layer 2 + Layer 3) ===
                 if not getattr(self.features, 'vital_analysis', True):
                     vital_multiplier = 1.0
                 elif (self.frame_count - self.warmup_frames) > self.spectral_frames:
@@ -458,39 +560,38 @@ class ActivityPipeline:
                     phase_var = np.var(phase_diff)
                     
                     if phase_var < config.tuning.ghost_phase_threshold:
+                        # Completely static reflection — no motion at all
                         vital_multiplier = 0.01
                         cand_micro_state = "STATIC_GHOST"
                     elif displacement_mm > config.tuning.macro_displacement_mm:
+                        # Large physical movement — clearly a person walking/shifting
                         vital_multiplier = 0.9 
                         cand_micro_state = "MACRO_PHASE"
                     elif phase_var > 0.3: 
+                        # Noticeable micro-motion — could be restless person
                         vital_multiplier = 0.7
                         cand_micro_state = "MICRO_PHASE"
                     else:
-                        detrended_phase = signal.detrend(cand_phase)
-                        window = np.hanning(self.spectral_frames)
-                        windowed_phase = detrended_phase * window
+                        # === Layer 3: Multi-metric aliveness replaces old SQI-only ===
+                        aliveness, cand_micro_state = self._compute_aliveness(cand_phase, cand_bin)
                         
-                        fft_result = np.fft.rfft(windowed_phase)
-                        fft_mag = np.abs(fft_result)
-                        freqs = np.fft.rfftfreq(self.spectral_frames, d=(1.0/config.radar.frame_rate))
-                        
-                        vital_band_mask = (freqs >= 0.15) & (freqs <= 0.7)
-                        eval_band_mask = (freqs >= 0.15) & (freqs <= 3.0) 
-                        
-                        vital_energy = np.sum(fft_mag[vital_band_mask])
-                        total_energy = np.sum(fft_mag[eval_band_mask])
-                        
-                        sqi = vital_energy / (total_energy + 1e-6)
-                        
-                        if sqi > 0.45:
+                        if aliveness >= config.tuning.aliveness_threshold:
                             vital_multiplier = 1.0
-                        elif sqi > 0.25:
+                        elif aliveness >= config.tuning.aliveness_threshold * 0.5:
                             vital_multiplier = 0.5
                         else:
                             vital_multiplier = 0.05
-                            cand_micro_state = "DEAD_SPACE"
-                
+
+                    # === Layer 2: Position Stability Penalty ===
+                    if len(self._pos_history) >= config.tuning.position_stability_window // 2:
+                        pos_arr = np.array(list(self._pos_history))
+                        pos_var = np.var(pos_arr[:, 0]) + np.var(pos_arr[:, 1])
+                        if pos_var > config.tuning.max_clutter_position_var:
+                            # Spatially unstable — likely clutter flickering between bins
+                            stability_penalty = np.clip(pos_var / config.tuning.max_clutter_position_var, 1.0, 3.0)
+                            vital_multiplier *= (1.0 / stability_penalty)
+                            logger.debug("Position stability penalty: var=%.4f, penalty=%.2f", pos_var, stability_penalty)
+
                 valid_candidates.append({
                     'bin': cand_bin,
                     'x': Pb_c[0], 'y': Pb_c[1], 'z': Pb_c[2],
@@ -514,6 +615,9 @@ class ActivityPipeline:
 
             raw_x, raw_y, raw_z = best_cand['x'], best_cand['y'], best_cand['z']
             raw_z = np.clip(raw_z, config.tuning.z_clip_min, config.tuning.z_clip_max)
+
+            # Record position for Layer 2 stability tracking
+            self._pos_history.append((raw_x, raw_y))
 
             if self.track_x is not None and getattr(self.features, 'tethering', True):
                 jump_dist = np.sqrt((raw_x - self.track_x)**2 + (raw_y - self.track_y)**2)

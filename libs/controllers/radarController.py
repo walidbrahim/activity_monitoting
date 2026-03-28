@@ -11,8 +11,8 @@ import platform
 
 # TODO: Make it configurable (Yaml file)
 if platform.system() == 'Darwin':
-    TI_CLI_SERIAL_PORT ="/dev/cu.usbserial-00E243020" #"/dev/cu.usbserial-00E2410B0"  # Home:"/dev/cu.usbserial-00E243020"  
-    SERIAL_PORT_NAME = "/dev/cu.usbserial-00E243021" #"/dev/cu.usbserial-00E2410B1" # Home: "/dev/cu.usbserial-00E243021"      
+    TI_CLI_SERIAL_PORT = "/dev/cu.usbserial-00E2410B0" #"/dev/cu.usbserial-00E243020" #"/dev/cu.usbserial-00E2410B0"  # Home:"/dev/cu.usbserial-00E243020"  
+    SERIAL_PORT_NAME = "/dev/cu.usbserial-00E2410B1" #"/dev/cu.usbserial-00E243021" # Home: "/dev/cu.usbserial-00E243021"      
 else:
     TI_CLI_SERIAL_PORT =  "/dev/ttyUSB0"
     SERIAL_PORT_NAME ="/dev/ttyUSB1"
