@@ -1,58 +1,71 @@
 layout:
   Room:
     type: "boundary"
-    x: [0.0, 2.58]
-    y: [0.0, 3.5]
+    x: [0, 2.5] #[0.0, 2.58]
+    y: [0, 2.5] #[0.0, 3.5]
     z: [0.0, 2.7]
     arm_move: [500, 500, 500, 500, 500, 500] # Default wide-view pose when empty
     radar_pose:
-      x: 1.22
-      y: 3.27
-      z: 1.03
-      yaw_deg: 180
-      pitch_deg: 0
+      x: 2.5 #1.22
+      y: 0 #3.27
+      z: 0.7 #1.03
+      yaw_deg: -45 #180
+      pitch_deg: -30
       fov_deg: 120
   Bed:
     type: "monitor"
-    x: [0.0, 1.05]
-    y: [1.45, 3.5]
-    z: [0.0, 2.7]
-    margin_x: [0.3, 0.3]
-    margin_y: [0.3, 0.0]
+    x: [1.5, 2.5]
+    y: [0, 2.3] #[1.45, 3.5]
+    z: [0.0, 2.0] # TODO: need to check the z bounds processing 
+    margin_x: [0.2, 0.2]
+    margin_y: [0.2, 0.2]
     arm_move: [500, 500, 200, 500, 500, 300] # motor positions
     radar_pose:
-      x: 1.2
-      y: 3.5
-      z: 0.95
-      yaw_deg: 210
-      pitch_deg: -35
+      x: 2.5 #1.2
+      y: 0 #3.5
+      z: 0.72 #0.95
+      yaw_deg: -45 #210
+      pitch_deg: -30 #-35
       fov_deg: 120
   Desk:
     type: "ignore"
-    x: [1.95, 2.58]
-    y: [1.6, 2.64]
-    z: [0.0, 1.2]
+    x: [0.2, 0.6] #[1.95, 2.58]
+    y: [2.2, 2.5] #[1.6, 2.64]
+    z: [0, 0.72] #[0.0, 1.2]
     arm_move: [500, 500, 500, 500, 500, 500] # motor positions
     radar_pose:
-      x: 1.15
-      y: 3.27
-      z: 1.0
-      yaw_deg: 240
-      pitch_deg: -25
+      x: 2.5
+      y: 0
+      z: 0.72
+      yaw_deg: -45
+      pitch_deg: -30
       fov_deg: 120
   Chair:
     type: "monitor"
-    x: [1.5, 2.0]
-    y: [1.6, 2.64]
+    x: [0.2, 0.6]
+    y: [1.8, 2.2]
     z: [0.0, 1.2]
     arm_move: [500, 500, 500, 500, 500, 600] # motor positions
     radar_pose:
-      x: 1.15
-      y: 3.27
-      z: 1.0
-      yaw_deg: 150
-      pitch_deg: 0
+      x: 2.5
+      y: 0
+      z: 0.72
+      yaw_deg: -45
+      pitch_deg: -30
       fov_deg: 120
+  # Sofa:
+  #   type: "monitor"
+  #   x: [3.0, 3.6]
+  #   y: [1.15, 1.7]
+  #   z: [0.0, 1.2]
+  #   arm_move: [500, 500, 500, 500, 500, 600] # motor positions
+  #   radar_pose:
+  #     x: 3.6
+  #     y: 0
+  #     z: 1.35
+  #     yaw_deg: -45
+  #     pitch_deg: 0
+  #     fov_deg: 120
 
 pushover:
   user_key: "ua846nsmwipsvkvk2r7guc1koekhnf"
@@ -76,6 +89,10 @@ radar:
   adc_sample_rate: 2000
   tx_ant: 2
   rx_ant: 4
+  mac_cli: "/dev/cu.usbserial-00E2410B0" #"/dev/cu.usbserial-00E242E70"  #"/dev/cu.usbserial-00E2410B0" #"/dev/cu.usbserial-00E243020" #"/dev/cu.usbserial-00E242E70"  
+  mac_data: "/dev/cu.usbserial-00E2410B1" #"/dev/cu.usbserial-00E2410B1" #"/dev/cu.usbserial-00E243021" #"/dev/cu.usbserial-00E242E71" 
+  linux_cli: "/dev/ttyUSB0"
+  linux_data: "/dev/ttyUSB1"
 
 pipeline:
   detection_threshold: 150.0
@@ -107,11 +124,19 @@ motion:
 
 respiration:
   resp_window_sec: 30
+  resp_lowpass_cutoff: 0.5
+  resp_lowpass_order: 4
+  resp_threshold: 0.1
+  apnea_hold_window_sec: 5.0
+  apnea_merge_gap_sec: 0.5
+  brv_history_size: 20
+  cycle_tracker_history: 5
+  bin_stability_sec: 2.0
 
 app:
   log_level: 10
   need_send_ti_config: true
-  send_alert: true
+  send_alert: false
   enable_robot_arm: false
   default_radar_pose: "Bed"
 

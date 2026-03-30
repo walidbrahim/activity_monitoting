@@ -5,7 +5,7 @@ import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 from config import config
 from libs.pipelines.activityPipeline import ActivityPipeline
-from libs.pipelines.respirationPipeline import RespiratoryPipeline
+from libs.pipelines.respirationPipeline import RespiratoryPipeline, RespiratoryPipelineV2
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ class ProcessorThread(QThread):
         
         # Instantiate the isolated math pipelines
         self.act_pipeline = ActivityPipeline(config.radar.range_idx_num, config.radar.range_resolution)
-        self.resp_pipeline = RespiratoryPipeline(fps=config.radar.frame_rate)
+        self.resp_pipeline = RespiratoryPipelineV2()
 
     def run(self):
         while self.running:

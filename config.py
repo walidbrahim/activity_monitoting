@@ -36,6 +36,10 @@ class RadarConfig(BaseModel):
     adc_sample_rate: int
     tx_ant: int
     rx_ant: int
+    mac_cli: str
+    mac_data: str
+    linux_cli: str
+    linux_data: str
 
 class PipelineFeatures(BaseModel):
     clutter_removal: bool = True
@@ -69,6 +73,14 @@ class MotionConfig(BaseModel):
 
 class RespirationConfig(BaseModel):
     resp_window_sec: int
+    resp_lowpass_cutoff: float = 0.5
+    resp_lowpass_order: int = 4
+    resp_threshold: float = 0.1
+    apnea_hold_window_sec: float = 3.0
+    apnea_merge_gap_sec: float = 0.5
+    brv_history_size: int = 20
+    cycle_tracker_history: int = 5
+    bin_stability_sec: float = 2.0
 
 class TuningConfig(BaseModel):
     min_search_range: float = 0.30

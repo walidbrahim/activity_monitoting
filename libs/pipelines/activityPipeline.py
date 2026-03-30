@@ -58,6 +58,7 @@ class ActivityPipeline:
         self.coord_buffer = deque(maxlen=config.pipeline.buffer_size)
         self.buffer_size = config.pipeline.buffer_size        
         self.track_confidence = 0   
+        self.macro_timers = {}
         self.confidence_threshold = 3 
         self.miss_allowance = config.pipeline.miss_allowance       
         self.miss_counter = 0
@@ -317,6 +318,7 @@ class ActivityPipeline:
         self.motion_level = 0.0
         self.current_micro_state = "STABLE"
         self._pos_history.clear()
+        self.macro_timers.clear()
         self.output_dict = {
             "X": None,
             "Y": None,
@@ -399,7 +401,7 @@ class ActivityPipeline:
                     bounds["z"][0] <= z <= bounds["z"][1]):
                     return f"Ignored ({name})", False
 
-        # 3. Target Zone Check (Beds and Monitors)
+        # 3. Target Zone Check (Monitored zones)
         for name, bounds in config.layout.items():
             zone_type = bounds.get("type")
             
@@ -419,13 +421,13 @@ class ActivityPipeline:
                         is_center_y = (y_min + m_y[0]) <= y <= (y_max - m_y[1])
                         
                         if is_center_x and is_center_y: return f"{name} - Center", True
-                        elif x < (x_min + m_x[0]):      return f"{name} - Right Edge", True
-                        elif x > (x_max - m_x[1]):      return f"{name} - Left Edge", True
-                        elif y < (y_min + m_y[0]):      return f"{name} - Foot Edge", True 
-                        elif y > (y_max - m_y[1]):      return f"{name} - Head Edge", True 
-                        else:                           return f"{name} - Corner", True
+                        elif x < (x_min + m_x[0]): return f"{name} - Right Edge", True
+                        elif x > (x_max - m_x[1]): return f"{name} - Left Edge", True
+                        elif y < (y_min + m_y[0]): return f"{name} - Foot Edge", True 
+                        elif y > (y_max - m_y[1]): return f"{name} - Head Edge", True 
+                        else: return f"{name} - Corner", True
                         
-                    # If it's just a monitor, return the name
+                    # If it's a monitored zone different than bed, return the name
                     return name, True
                     
         # 4. Fallback: Inside the room, but not in a predefined zone
@@ -451,8 +453,8 @@ class ActivityPipeline:
 
         if self.frame_count <= self.warmup_frames:
             current_alpha_array = np.full(self.num_range_bins, 0.3)
-        elif not self.is_occupied or getattr(self, 'last_target_bin', None) is None:
-            # Evaporate ghosts globally while empty
+        elif not self.is_occupied or getattr(self, 'last_target_bin', None) is None or self.track_confidence < self.confidence_threshold:
+            # Evaporate ghosts globally while empty or unconfirmed
             current_alpha_array = np.full(self.num_range_bins, self.alpha)
         else:
             # Spatially Masked Learning: Freeze background map only near the user!
@@ -541,6 +543,7 @@ class ActivityPipeline:
                 continue  # Too weak to be a person — skip entirely
 
             zone_name, is_valid = self.evaluate_spatial_zone(Pb_c[0], Pb_c[1], Pb_c[2])
+            # print(zone_name)
             if is_valid and zone_name != "Out of Bounds (Ghost)":
                 cand_micro_state = "STABLE"
                 vital_multiplier = 0.1
@@ -558,20 +561,33 @@ class ActivityPipeline:
                     
                     phase_diff = np.diff(cand_phase)
                     phase_var = np.var(phase_diff)
+                    phase_drift = abs(cand_phase[-1] - cand_phase[0])
                     
                     if phase_var < config.tuning.ghost_phase_threshold:
                         # Completely static reflection — no motion at all
                         vital_multiplier = 0.01
                         cand_micro_state = "STATIC_GHOST"
+                        self.macro_timers[cand_bin] = 0
+                    elif phase_drift > (10 * np.pi):
+                        # Continuous unidirectional phase wrap tricking FFT (e.g. spinning fans)
+                        vital_multiplier = 0.01
+                        cand_micro_state = "MECHANICAL_ROTOR"
+                        self.macro_timers[cand_bin] = 0
                     elif displacement_mm > config.tuning.macro_displacement_mm:
                         # Large physical movement — clearly a person walking/shifting
-                        vital_multiplier = 0.9 
                         cand_micro_state = "MACRO_PHASE"
-                    elif phase_var > 0.3: 
-                        # Noticeable micro-motion — could be restless person
+                        self.macro_timers[cand_bin] = self.macro_timers.get(cand_bin, 0) + 1
+                        if self.macro_timers[cand_bin] > 5 * config.radar.frame_rate:
+                            vital_multiplier = 0.1 # Penalty for swinging objects that never breathe
+                        else:
+                            vital_multiplier = 0.9 
+                    elif phase_var > 0.3 and dynamic_mag_profile[cand_bin] > self.detection_threshold * 2.0: 
+                        # High-energy Noticeable micro-motion — prevents white-noise from falsely bypassing Layer 3
                         vital_multiplier = 0.7
                         cand_micro_state = "MICRO_PHASE"
+                        self.macro_timers[cand_bin] = 0
                     else:
+                        self.macro_timers[cand_bin] = 0
                         # === Layer 3: Multi-metric aliveness replaces old SQI-only ===
                         aliveness, cand_micro_state = self._compute_aliveness(cand_phase, cand_bin)
                         
@@ -612,7 +628,7 @@ class ActivityPipeline:
             final_peak_bin = best_cand['bin']
             self.current_active_zone = best_cand['zone']
             self.current_micro_state = best_cand.get('micro_state', 'STABLE')
-
+            # print("current_active_zone: ", self.current_active_zone)
             raw_x, raw_y, raw_z = best_cand['x'], best_cand['y'], best_cand['z']
             raw_z = np.clip(raw_z, config.tuning.z_clip_min, config.tuning.z_clip_max)
 
@@ -640,19 +656,18 @@ class ActivityPipeline:
         return {
             "is_jump": is_jump,
             "is_valid_point": is_valid_point,
-            "final_peak_bin": final_peak_bin,
             "dynamic_peak_bin": dynamic_peak_bin,
             "raw_x": raw_x,
             "raw_y": raw_y,
             "raw_z": raw_z
         }
 
-    def _step3_state_machine(self, dynamic_mag_profile, dynamic_peak_bin, raw_x, raw_y, raw_z, is_jump, raw_mag_profile, corrected_data):
-        current_threshold = self.detection_threshold if not self.is_occupied else (self.detection_threshold * 0.75)  
+    def _step3_state_machine(self, dynamic_mag_profile, dynamic_peak_bin, raw_x, raw_y, raw_z, is_jump, raw_mag_profile, corrected_data, is_valid_point):
+        current_threshold = self.detection_threshold #if not self.is_occupied else (self.detection_threshold * 0.75)  
         status = self.output_dict.get("status", "")
-
+        # print(f"\ndynamic_peak_bin: {dynamic_peak_bin}, dynamic_mag_profile: {dynamic_mag_profile[dynamic_peak_bin]}, threshold: {self.detection_threshold}")
         if not getattr(self.features, 'apnea_state', True):
-            if not is_jump and dynamic_mag_profile[dynamic_peak_bin] >= self.detection_threshold:
+            if is_valid_point and not is_jump and dynamic_mag_profile[dynamic_peak_bin] >= self.detection_threshold:
                 self.is_occupied = True
                 self.last_target_bin = dynamic_peak_bin
                 self.last_target_coords = (raw_x, raw_y, raw_z)
@@ -662,17 +677,28 @@ class ActivityPipeline:
                 return {"abort": True}
 
         is_active_target = False
-        if not is_jump and dynamic_mag_profile[dynamic_peak_bin] >= self.detection_threshold:
+        if is_valid_point and not is_jump and dynamic_mag_profile[dynamic_peak_bin] >= self.detection_threshold:
             if getattr(self.features, 'apnea_state', True):
-                if getattr(self, 'current_micro_state', 'STABLE') not in ["DEAD_SPACE", "STATIC_GHOST"]:
-                    is_active_target = True
+                micro = getattr(self, 'current_micro_state', 'STABLE')
+                if micro not in ["DEAD_SPACE", "STATIC_GHOST", "MECHANICAL_ROTOR"]:
+                    # Do not let random weak-noise spectral flashes awaken a completely empty room
+                    if not self.is_occupied and micro == "WEAK_VITAL" and dynamic_mag_profile[dynamic_peak_bin] < self.detection_threshold * 2.0:
+                        is_active_target = False
+                    else:
+                        is_active_target = True
             else:
                 is_active_target = True
+
+        if not is_active_target and not self.is_occupied:
+            # Decay the burst accumulator over empty frames to safely absorb transient random 
+            # interference (e.g. winds or split-second external movements) without tripping Occupied
+            if hasattr(self, 'entry_frames') and self.entry_frames > 0:
+                self.entry_frames = max(0, self.entry_frames - 1)
 
         if is_active_target:
             if not self.is_occupied:
                 self.entry_frames += 1
-                if self.entry_frames < self.frames_to_occupy:
+                if getattr(self, 'entry_frames', 0) < getattr(self, 'frames_to_occupy', 10):
                     return {"abort": True}
             
             self.is_occupied = True
@@ -962,7 +988,8 @@ class ActivityPipeline:
         s3 = self._step3_state_machine(
             s1["dynamic_mag_profile"], s2["dynamic_peak_bin"], 
             s2["raw_x"], s2["raw_y"], s2["raw_z"], 
-            s2["is_jump"], s1["raw_mag_profile"], s1["corrected_data"]
+            s2["is_jump"], s1["raw_mag_profile"], s1["corrected_data"],
+            s2["is_valid_point"]
         )
         if s3.get("abort"): return self.output_dict
 
@@ -995,13 +1022,15 @@ class ActivityPipeline:
 
         # Build ordered spectral history for downstream consumers (respiration pipeline)
         ordered_spectral = self._get_ordered_history(self.spectral_history, self._ring_idx_spectral, self.spectral_frames)
-
+        # print(f"final_zone: {s6['final_zone']}")
         # Finalize Output
         self.output_dict.update({
             "X": s5["X_b"],
             "Y": s5["Y_b"],
             "Z": s5["Z_b"],
             "final_bin": s2["dynamic_peak_bin"],
+            "dynamic_mag": s1["dynamic_mag_profile"][s2["dynamic_peak_bin"]],
+            "detection_threshold": self.detection_threshold,
             "zone": s6["final_zone"],
             "status": s6["status"],
             "occ_confidence": s7["occ_confidence"],

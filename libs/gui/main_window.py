@@ -74,6 +74,8 @@ class MainWindow(QMainWindow):
         self.posture_hist = [0] * hist_len
         self.motion_hist = [0] * hist_len
         self.fall_hist = [0] * hist_len
+        self.mag_hist = [0] * hist_len
+        self.thresh_hist = [0] * hist_len
         self.x_axis = np.linspace(-config.respiration.resp_window_sec, 0, hist_len)
 
         central_widget = QWidget()
@@ -96,8 +98,12 @@ class MainWindow(QMainWindow):
         resp_layout = QVBoxLayout(self.tab_resp)
         resp_layout.setContentsMargins(5, 5, 5, 5)
 
-        self.resp_plot = self._create_plot("🫁 Live Breathing Signal", "", "")
-        self.resp_plot.setYRange(-3.14, 3.14)
+        self.resp_plot = self._create_plot("🫁 Live Breathing Signal", "Time (s)", "Displacement (mm)")
+        self._resp_window = config.respiration.resp_window_sec
+        self.resp_plot.setXRange(-self._resp_window, 0, padding=0)
+        self.resp_plot.setYRange(-25, 25)
+        self.resp_plot.enableAutoRange(axis='x', enable=False)
+        self.resp_plot.enableAutoRange(axis='y', enable=False)
         self.curve_resp = self.resp_plot.plot(pen=pg.mkPen(color=config.gui_theme.occupant, width=2))
         self.curve_resp_zero = self.resp_plot.plot(pen=pg.mkPen(None))  # invisible baseline
         occ_c = QColor(config.gui_theme.occupant)
@@ -107,15 +113,57 @@ class MainWindow(QMainWindow):
         self.scatter_exhale = pg.ScatterPlotItem(size=10, brush=pg.mkBrush('red'), symbol='t1')
         self.resp_plot.addItem(self.scatter_inhale)
         self.resp_plot.addItem(self.scatter_exhale)
+
+        # Annotations on respiration plot
+        self._resp_annotations = {}
+        ann_style_white = {'color': config.gui_theme.text, 'size': '11pt'}
+        ann_style_red = {'color': '#EF4444', 'size': '11pt', 'bold': True}
+        ann_style_green = {'color': '#22C55E', 'size': '11pt'}
+
+        self._resp_ann_depth = pg.TextItem("", anchor=(0, 0), color=config.gui_theme.text)
+        self._resp_ann_depth.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.resp_plot.addItem(self._resp_ann_depth)
+
+        self._resp_ann_apnea = pg.TextItem("", anchor=(1, 0), color='#EF4444')
+        self._resp_ann_apnea.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.resp_plot.addItem(self._resp_ann_apnea)
+
+        self._resp_ann_cycles = pg.TextItem("", anchor=(0, 1), color=config.gui_theme.subtext)
+        self._resp_ann_cycles.setFont(QFont("Arial", 10))
+        self.resp_plot.addItem(self._resp_ann_cycles)
+
+        self._resp_ann_conf = pg.TextItem("", anchor=(1, 1), color=config.gui_theme.subtext)
+        self._resp_ann_conf.setFont(QFont("Arial", 10))
+        self.resp_plot.addItem(self._resp_ann_conf)
+
+        # Apnea red-zone overlay regions
+        self._apnea_regions = []
+
         resp_layout.addWidget(self.resp_plot, stretch=2)
 
         self.rr_plot = self._create_plot("📈 Respiration Rate (RR)", "Time (s)", "BPM")
+        self.rr_plot.setXRange(-self._resp_window, 0, padding=0)
         self.rr_plot.setYRange(0, 40)
+        self.rr_plot.enableAutoRange(axis='x', enable=False)
         self.curve_rr = self.rr_plot.plot(pen=pg.mkPen(color=config.gui_theme.text, width=2))
         self.curve_rr_zero = self.rr_plot.plot(pen=pg.mkPen(None))
         txt_c = QColor(config.gui_theme.text)
         self.fill_rr = pg.FillBetweenItem(self.curve_rr, self.curve_rr_zero, brush=pg.mkBrush(txt_c.red(), txt_c.green(), txt_c.blue(), 25))
         self.rr_plot.addItem(self.fill_rr)
+
+        # Annotations on RR plot
+        self._rr_ann_current = pg.TextItem("", anchor=(1, 0), color=config.gui_theme.text)
+        self._rr_ann_current.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        self.rr_plot.addItem(self._rr_ann_current)
+
+        self._rr_ann_brv = pg.TextItem("", anchor=(0, 0), color=config.gui_theme.subtext)
+        self._rr_ann_brv.setFont(QFont("Arial", 10))
+        self.rr_plot.addItem(self._rr_ann_brv)
+
+        self._rr_ann_cycle = pg.TextItem("", anchor=(0.5, 0), color=config.gui_theme.subtext)
+        self._rr_ann_cycle.setFont(QFont("Arial", 10))
+        self.rr_plot.addItem(self._rr_ann_cycle)
+
         resp_layout.addWidget(self.rr_plot, stretch=2)
         
         self.vitals_tabs.addTab(self.tab_resp, "🫁 Respiration")
@@ -156,7 +204,19 @@ class MainWindow(QMainWindow):
         self.radar_plot.addItem(self.scatter_occupant)
         right_layout.addWidget(self.radar_plot, stretch=3)
 
-        # Trends (Bottom Right)
+        # Analytics Tabs (Bottom Right)
+        self.analytics_tabs = QTabWidget()
+        self.analytics_tabs.setStyleSheet(f"""
+            QTabWidget::pane {{ border: 1px solid {config.gui_theme.grid}; border-radius: 5px; }}
+            QTabBar::tab {{ background: {config.gui_theme.panel_bg}; color: {config.gui_theme.subtext}; padding: 8px 15px; border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }}
+            QTabBar::tab:selected {{ background: {config.gui_theme.card_bg}; color: {config.gui_theme.text}; font-weight: bold; border-bottom: 2px solid {config.gui_theme.occupant}; }}
+        """)
+
+        # Tab 1: Confidence
+        self.tab_conf = QWidget()
+        conf_layout = QVBoxLayout(self.tab_conf)
+        conf_layout.setContentsMargins(5, 5, 5, 5)
+
         self.trend_plot = self._create_plot("📊 Confidence: Occupancy / Posture / Fall", "Time (s)", "Normalized")
         self.trend_plot.setYRange(0, 1.05)
         self.curve_occ = self.trend_plot.plot(pen=pg.mkPen(color='#38BDF8', width=2), name="Occupancy")
@@ -166,20 +226,58 @@ class MainWindow(QMainWindow):
         self.curve_post = self.trend_plot.plot(pen=pg.mkPen(color='#F59E0B', width=2), name="Posture")
         self.curve_mot = self.trend_plot.plot(pen=pg.mkPen(color='#22C55E', width=2, style=Qt.PenStyle.DashLine), name="Motion")
         self.curve_fall = self.trend_plot.plot(pen=pg.mkPen(color='#EF4444', width=2), name="Fall")
-        right_layout.addWidget(self.trend_plot, stretch=1)
+        conf_layout.addWidget(self.trend_plot)
+        self.analytics_tabs.addTab(self.tab_conf, "📊 Confidence")
+
+        # Tab 2: Target Power
+        self.tab_power = QWidget()
+        power_layout = QVBoxLayout(self.tab_power)
+        power_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.mag_plot = self._create_plot("⚡ Dynamic Target Search Power", "Time (s)", "Magnitude")
+        self.mag_plot.enableAutoRange(axis='y', enable=True)
+        self.curve_mag = self.mag_plot.plot(pen=pg.mkPen(color='#38BDF8', width=2), name="Target Mag")
+        self.curve_mag_fill = self.mag_plot.plot(pen=pg.mkPen(None))
+        self.fill_mag = pg.FillBetweenItem(self.curve_mag, self.curve_mag_fill, brush=pg.mkBrush(56, 189, 248, 25))
+        self.mag_plot.addItem(self.fill_mag)
+        
+        self.curve_thresh = self.mag_plot.plot(pen=pg.mkPen(color='#EF4444', width=2, style=Qt.PenStyle.DashLine), name="Threshold")
+        
+        self._mag_ann_bin = pg.TextItem("", anchor=(0, 1), color=config.gui_theme.text)
+        self._mag_ann_bin.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        self._mag_ann_bin.setPos(-config.respiration.resp_window_sec, 200) # dynamic later but initial
+        self.mag_plot.addItem(self._mag_ann_bin)
+        
+        power_layout.addWidget(self.mag_plot)
+        self.analytics_tabs.addTab(self.tab_power, "⚡ Target Power")
+
+        right_layout.addWidget(self.analytics_tabs, stretch=1)
 
         body_layout.addLayout(right_layout, stretch=1)
         main_layout.addLayout(body_layout, stretch=4)
 
         # 2. Bottom Cards
         cards_layout = QHBoxLayout()
-        self.occ_card = CardWidget("📍 Occupancy", ["Zone", "State", "Confidence", "Duration"])
+        self.occ_card = CardWidget("📍 Occupancy", ["Zone", "State", "Confidence", "Duration", "Target Power"])
         self.post_card = CardWidget("🧍 Posture & Motion", ["Posture", "Posture conf.", "Height (Range)", "Motion"])
         self.sys_card = CardWidget("⚙️ System", ["Radar", "Tracking", "Fall state", "Fall conf."])
         cards_layout.addWidget(self.occ_card)
         cards_layout.addWidget(self.post_card)
         cards_layout.addWidget(self.sys_card)
         main_layout.addLayout(cards_layout, stretch=1)
+
+        # 3. Breathing Info Bar
+        self.resp_info_bar = QLabel("🫁 Waiting for breathing data...")
+        self.resp_info_bar.setStyleSheet(f"""
+            color: {config.gui_theme.text};
+            background-color: {config.gui_theme.card_bg};
+            padding: 8px 15px;
+            border-radius: 6px;
+            font-size: 13px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        """)
+        self.resp_info_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.addWidget(self.resp_info_bar)
 
     def _create_plot(self, title, xlabel, ylabel):
         p = pg.PlotWidget()
@@ -302,6 +400,7 @@ class MainWindow(QMainWindow):
     def update_dashboard(self, occ_dict, resp_dict):
         # Update Cards
         zone = occ_dict.get("zone", "--")
+        # print("zone: ", zone)
         
         # Highlight Logic — Dynamic Color Temperature
         if hasattr(self, 'zone_rects'):
@@ -330,7 +429,8 @@ class MainWindow(QMainWindow):
             Zone=zone,
             State=state[:20] + "..." if len(state)>20 else state,
             Confidence=f"{int(occ_dict.get('occ_confidence', 0))}%",
-            Duration=occ_dict.get("duration_str", "--")
+            Duration=occ_dict.get("duration_str", "--"),
+            **{"Target Power": f"{occ_dict.get('dynamic_mag', 0):.1f} / {occ_dict.get('detection_threshold', 150.0):.1f}"}
         )
 
         z = occ_dict.get("Z")
@@ -379,6 +479,20 @@ class MainWindow(QMainWindow):
         self.fall_hist.append(np.clip(fc/100.0, 0, 1))
         self.curve_fall.setData(self.x_axis, self.fall_hist)
 
+        # Update Target Power Trends
+        self.mag_hist.pop(0)
+        self.mag_hist.append(occ_dict.get('dynamic_mag', 0.0))
+        self.curve_mag.setData(self.x_axis, self.mag_hist)
+        self.curve_mag_fill.setData(self.x_axis, np.zeros(len(self.mag_hist)))
+        
+        thresh_val = occ_dict.get('detection_threshold', 150.0)
+        self.thresh_hist.pop(0)
+        self.thresh_hist.append(thresh_val)
+        self.curve_thresh.setData(self.x_axis, self.thresh_hist)
+
+        sel_bin = occ_dict.get('final_bin', 0)
+        self._mag_ann_bin.setText(f"Active Bin: {sel_bin}")
+
         # Update Radar Scatter
         if occ_dict.get("X") is not None and occ_dict.get("status") != "No Occupant":
             x, y = occ_dict["X"], occ_dict["Y"]
@@ -402,29 +516,136 @@ class MainWindow(QMainWindow):
             self.scatter_halo.setData([], [])
 
         # Update Respiratory
-        if resp_dict and resp_dict.get('confidence', 0) > 0:
+        if resp_dict and (resp_dict.get('confidence', 0) > 0 or resp_dict.get('is_calibrating', False)):
             sig = resp_dict.get('live_signal', [])
             x_sig = self.x_axis[-len(sig):]
             self.curve_resp.setData(x_sig, sig)
             self.curve_resp_zero.setData(x_sig, np.zeros(len(sig)))
-            
+
             rr_hist = resp_dict.get('rr_history', [])
             x_rr = self.x_axis[-len(rr_hist):]
             self.curve_rr.setData(x_rr, rr_hist)
             self.curve_rr_zero.setData(x_rr, np.zeros(len(rr_hist)))
-            
+
             # Scatters
             inhs = resp_dict.get('inhales', [])
             exhs = resp_dict.get('exhales', [])
             if len(inhs) > 0 and len(sig) > 0:
-                self.scatter_inhale.setData(self.x_axis[inhs], sig[inhs])
+                self.scatter_inhale.setData(x_sig[inhs], sig[inhs])
             else:
                 self.scatter_inhale.setData([], [])
-                
+
             if len(exhs) > 0 and len(sig) > 0:
-                self.scatter_exhale.setData(self.x_axis[exhs], sig[exhs])
+                self.scatter_exhale.setData(x_sig[exhs], sig[exhs])
             else:
                 self.scatter_exhale.setData([], [])
+
+            # --- Apnea Red-Zone Highlighting ---
+            for region in self._apnea_regions:
+                self.resp_plot.removeItem(region)
+            self._apnea_regions.clear()
+
+            for (start, end) in resp_dict.get('apnea_segments', []):
+                if 0 <= start < len(x_sig) and 0 < end <= len(x_sig):
+                    t_start = x_sig[start]
+                    t_end = x_sig[min(end, len(x_sig) - 1)]
+                    region = pg.LinearRegionItem(
+                        values=[t_start, t_end],
+                        brush=pg.mkBrush(239, 68, 68, 40),  # #EF4444 at 40 alpha
+                        movable=False
+                    )
+                    region.setZValue(-10)
+                    self.resp_plot.addItem(region)
+                    self._apnea_regions.append(region)
+
+            # --- Annotations on Respiration Plot (fixed coordinates) ---
+            rx_min = -self._resp_window
+            rx_max = 0
+            ry_min = -20
+            ry_max = 20
+
+            # Top-left: Depth
+            depth = resp_dict.get('depth', 'unknown')
+            depth_colors = {'normal': '#22C55E', 'deep': '#38BDF8', 'shallow': '#F59E0B', 'apnea': '#EF4444'}
+            depth_color = depth_colors.get(depth, config.gui_theme.subtext)
+            self._resp_ann_depth.setText(f"Depth: {depth.capitalize()}")
+            self._resp_ann_depth.setColor(QColor(depth_color))
+            self._resp_ann_depth.setPos(rx_min, ry_max)
+
+            # Top-right: Apnea count
+            apnea_count = resp_dict.get('apnea_count', 0)
+            apnea_text = f"Apnea: {apnea_count}"
+            if resp_dict.get('apnea_active', False):
+                dur = resp_dict.get('apnea_duration', 0)
+                apnea_text += f" (active {dur:.1f}s)"
+            self._resp_ann_apnea.setText(apnea_text)
+            self._resp_ann_apnea.setPos(rx_max, ry_max)
+
+            # Bottom-left: Cycle count
+            cycle_count = resp_dict.get('cycle_count', 0)
+            self._resp_ann_cycles.setText(f"Cycles: {cycle_count}")
+            self._resp_ann_cycles.setPos(rx_min, ry_min)
+
+            # Top-right: Confidence / Calibration Override
+            is_calib = resp_dict.get('is_calibrating', False)
+            if is_calib:
+                self._resp_ann_conf.setText("Calibrating Threshold...")
+                self._resp_ann_conf.setColor(QColor('#F59E0B'))
+                self._resp_ann_apnea.setText("")
+            else:
+                conf = resp_dict.get('confidence', 0)
+                conf_color = '#22C55E' if conf > 60 else ('#F59E0B' if conf > 30 else '#EF4444')
+                self._resp_ann_conf.setText(f"Confidence: {conf:.0f}%")
+                self._resp_ann_conf.setColor(QColor(conf_color))
+                
+            self._resp_ann_conf.setPos(rx_max, ry_min)
+
+            # --- Annotations on RR Plot (fixed coordinates) ---
+            rrx_min = -self._resp_window
+            rrx_max = 0
+            rry_max = 40
+
+            # Top-right: Current RR
+            rr_val = resp_dict.get('rr_current', 0)
+            if rr_val > 0 and not is_calib:
+                rr_color = '#22C55E' if 6 <= rr_val <= 30 else '#F59E0B'
+                self._rr_ann_current.setText(f"RR: {rr_val:.1f} bpm")
+                self._rr_ann_current.setColor(QColor(rr_color))
+            else:
+                self._rr_ann_current.setText("RR: --")
+                self._rr_ann_current.setColor(QColor(config.gui_theme.subtext))
+            self._rr_ann_current.setPos(rrx_max, rry_max)
+
+            # Top-left: BRV
+            brv = resp_dict.get('brv_value', 0)
+            brv_text = f"BRV: {brv:.3f}s" if (brv > 0 and not is_calib) else "BRV: --"
+            self._rr_ann_brv.setText(brv_text)
+            self._rr_ann_brv.setPos(rrx_min, rry_max)
+
+            # Top-center: Last cycle
+            last_cyc = resp_dict.get('last_cycle_duration', 0)
+            cyc_text = f"Last cycle: {last_cyc:.2f}s" if (last_cyc > 0 and not is_calib) else "Last cycle: --"
+            self._rr_ann_cycle.setText(cyc_text)
+            self._rr_ann_cycle.setPos((rrx_min + rrx_max) / 2, rry_max)
+
+            # Update breathing info bar
+            sig = resp_dict.get('live_signal', np.array([]))
+            locked_bin = resp_dict.get('locked_bin', 0)
+            bin_dist = (locked_bin or 0) * config.radar.range_resolution
+            if is_calib:
+                self.resp_info_bar.setText(f"🎯 Bin: {locked_bin} ({bin_dist:.2f} m)   |   ⏳ Calibrating Apnea Threshold for 40 seconds...")
+            else:
+                parts = [
+                    f"🎯 Bin: {locked_bin} ({bin_dist:.2f} m)",
+                    f"📊 Confidence: {resp_dict.get('confidence', 0):.0f}%",
+                    f"💨 RR: {rr_val:.1f} bpm" if rr_val > 0 else "💨 RR: --",
+                    f"🔄 Cycles: {resp_dict.get('cycle_count', 0)}",
+                    f"🚫 Apnea: {resp_dict.get('apnea_count', 0)}",
+                    f"📏 Depth: {resp_dict.get('depth', 'unknown')}",
+                    f"📐 Amplitude: {np.ptp(sig):.2f} mm" if len(sig) > 0 else "📐 Amplitude: --",
+                ]
+                self.resp_info_bar.setText("   |   ".join(parts))
+
         else:
             self.curve_resp.setData([], [])
             self.curve_resp_zero.setData([], [])
@@ -432,3 +653,18 @@ class MainWindow(QMainWindow):
             self.curve_rr_zero.setData([], [])
             self.scatter_inhale.setData([], [])
             self.scatter_exhale.setData([], [])
+
+            # Clear apnea regions
+            for region in self._apnea_regions:
+                self.resp_plot.removeItem(region)
+            self._apnea_regions.clear()
+
+            # Clear annotations
+            self._resp_ann_depth.setText("")
+            self._resp_ann_apnea.setText("")
+            self._resp_ann_cycles.setText("")
+            self._resp_ann_conf.setText("")
+            self._rr_ann_current.setText("")
+            self._rr_ann_brv.setText("")
+            self._rr_ann_cycle.setText("")
+            self.resp_info_bar.setText("🫁 Waiting for breathing data...")

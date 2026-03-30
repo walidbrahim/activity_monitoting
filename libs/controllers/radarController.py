@@ -11,11 +11,11 @@ import platform
 
 # TODO: Make it configurable (Yaml file)
 if platform.system() == 'Darwin':
-    TI_CLI_SERIAL_PORT = "/dev/cu.usbserial-00E2410B0" #"/dev/cu.usbserial-00E243020" #"/dev/cu.usbserial-00E2410B0"  # Home:"/dev/cu.usbserial-00E243020"  
-    SERIAL_PORT_NAME = "/dev/cu.usbserial-00E2410B1" #"/dev/cu.usbserial-00E243021" # Home: "/dev/cu.usbserial-00E243021"      
+    TI_CLI_SERIAL_PORT = config.radar.mac_cli
+    SERIAL_PORT_NAME = config.radar.mac_data
 else:
-    TI_CLI_SERIAL_PORT =  "/dev/ttyUSB0"
-    SERIAL_PORT_NAME ="/dev/ttyUSB1"
+    TI_CLI_SERIAL_PORT =  config.radar.linux_cli
+    SERIAL_PORT_NAME = config.radar.linux_data
 
 class WisSerial:
     def __init__(self, port=SERIAL_PORT_NAME, baudrate=921600):
