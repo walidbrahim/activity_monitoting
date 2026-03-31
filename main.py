@@ -12,7 +12,7 @@ from libs.gui.main_window import MainWindow
 from libs.utils import send_watch_alert
 
 def main():
-    print("Starting Bed Occupation Visualizer (PyQt Version)...")
+    print("Starting Room Activity Monitoring Visualizer ...")
 
     # 1. Start the Qt Application
     app = QApplication(sys.argv)

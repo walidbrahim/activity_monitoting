@@ -13,9 +13,12 @@ import platform
 if platform.system() == 'Darwin':
     TI_CLI_SERIAL_PORT = config.radar.mac_cli
     SERIAL_PORT_NAME = config.radar.mac_data
-else:
+elif platform.system() == 'Linux':
     TI_CLI_SERIAL_PORT =  config.radar.linux_cli
     SERIAL_PORT_NAME = config.radar.linux_data
+else:
+    TI_CLI_SERIAL_PORT =  config.radar.win_cli
+    SERIAL_PORT_NAME = config.radar.win_data
 
 class WisSerial:
     def __init__(self, port=SERIAL_PORT_NAME, baudrate=921600):

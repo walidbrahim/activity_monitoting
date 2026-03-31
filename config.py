@@ -40,6 +40,8 @@ class RadarConfig(BaseModel):
     mac_data: str
     linux_cli: str
     linux_data: str
+    win_cli: str
+    win_data: str
 
 class PipelineFeatures(BaseModel):
     clutter_removal: bool = True
@@ -70,6 +72,10 @@ class PostureConfig(BaseModel):
 class MotionConfig(BaseModel):
     rest_max: float
     restless_max: float
+    # Walking detection
+    walk_window_frames: int   = 15    # look-back window for net XY displacement (~0.6 s at 25 fps)
+    walk_displacement_m: float = 0.30 # minimum net translation to classify as Walking
+    walk_posture_conf: float  = 90.0  # posture_confidence floor when walking is confirmed
 
 class RespirationConfig(BaseModel):
     resp_window_sec: int

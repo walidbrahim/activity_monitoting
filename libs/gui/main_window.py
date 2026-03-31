@@ -6,7 +6,7 @@ from PyQt6.QtCore import pyqtSlot, Qt, QTimer
 from PyQt6.QtGui import QFont, QColor
 import pyqtgraph as pg
 from config import config
-from libs.gui.posture_widget import PostureCard, RadarPostureItem
+from libs.gui.posture_widget import PostureCard, RadarPostureItem, _classify_motion
 
 class CardWidget(QFrame):
     def __init__(self, title, lines):
@@ -27,7 +27,7 @@ class CardWidget(QFrame):
         layout.setContentsMargins(15, 15, 15, 15)
         
         self.title_lbl = QLabel(title)
-        self.title_lbl.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+        self.title_lbl.setFont(QFont("Arial", 18, QFont.Weight.Bold))
         self.title_lbl.setStyleSheet(f"color: {config.gui_theme.text};")
         layout.addWidget(self.title_lbl)
         
@@ -71,22 +71,31 @@ class MainWindow(QMainWindow):
 
         # History Buffers for plotting
         hist_len = int(config.respiration.resp_window_sec * config.radar.frame_rate)
-        self.occ_hist = [0] * hist_len
-        self.posture_hist = [0] * hist_len
-        self.motion_hist = [0] * hist_len
-        self.fall_hist = [0] * hist_len
-        self.mag_hist = [0] * hist_len
-        self.thresh_hist = [0] * hist_len
+        self.occ_hist       = [0]   * hist_len
+        self.posture_hist   = [0]   * hist_len
+        self.motion_hist    = [0]   * hist_len
+        self.fall_hist      = [0]   * hist_len
+        self.mag_hist       = [0]   * hist_len
+        self.thresh_hist    = [0]   * hist_len
+        self.height_hist    = [0.0] * hist_len  # real-time Z (height) history
+        self.posture_num_hist = [0] * hist_len  # posture encoded as integer for timeline plot
         self.x_axis = np.linspace(-config.respiration.resp_window_sec, 0, hist_len)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # 1. Main Body Layout (Left: Vitals Tabs, Right: Radar & Trends)
-        body_layout = QHBoxLayout()
-        
-        # Left Column (Vitals Tabs)
+        # Two-column layout: each column manages its own vertical split independently.
+        # Left col:  vitals tabs (top)          + occ/posture cards (bottom)
+        # Right col: radar map  (top, 3/4 tall) + analytics/confidence plots (bottom, 1/4)
+        columns_layout = QHBoxLayout()
+        columns_layout.setSpacing(10)
+        columns_layout.setContentsMargins(0, 0, 0, 0)
+
+        left_col = QVBoxLayout()
+        left_col.setSpacing(8)
+
+        # Left Column — Vitals Tabs
         self.vitals_tabs = QTabWidget()
         self.vitals_tabs.setStyleSheet(f"""
             QTabWidget::pane {{ border: 1px solid {config.gui_theme.grid}; border-radius: 5px; }}
@@ -188,10 +197,9 @@ class MainWindow(QMainWindow):
         hr_layout.addWidget(self.hr_rate_plot, stretch=1)
 
         self.vitals_tabs.addTab(self.tab_hr, "❤️ Cardiac Information")
-        
-        body_layout.addWidget(self.vitals_tabs, stretch=2)
+        left_col.addWidget(self.vitals_tabs, stretch=4)
 
-        # Right Column (Radar Map & Trends)
+        # Right Column (Radar Map + Analytics directly below)
         right_layout = QVBoxLayout()
         
         # Radar Layout (Top Right)
@@ -232,8 +240,22 @@ class MainWindow(QMainWindow):
         self.curve_post = self.trend_plot.plot(pen=pg.mkPen(color='#F59E0B', width=2), name="Posture")
         self.curve_mot = self.trend_plot.plot(pen=pg.mkPen(color='#22C55E', width=2, style=Qt.PenStyle.DashLine), name="Motion")
         self.curve_fall = self.trend_plot.plot(pen=pg.mkPen(color='#EF4444', width=2), name="Fall")
+
+        # Legend
+        conf_legend = self.trend_plot.addLegend(
+            offset=(10, 10),
+            labelTextColor=config.gui_theme.text,
+            brush=pg.mkBrush(config.gui_theme.card_bg + "CC"),
+            pen=pg.mkPen(config.gui_theme.grid),
+        )
+        conf_legend.addItem(self.curve_occ,  "Occupancy")
+        conf_legend.addItem(self.curve_post, "Posture")
+        conf_legend.addItem(self.curve_mot,  "Motion")
+        conf_legend.addItem(self.curve_fall, "Fall")
+
         conf_layout.addWidget(self.trend_plot)
         self.analytics_tabs.addTab(self.tab_conf, "📊 Confidence")
+
 
         # Tab 2: Target Power
         self.tab_power = QWidget()
@@ -257,27 +279,109 @@ class MainWindow(QMainWindow):
         power_layout.addWidget(self.mag_plot)
         self.analytics_tabs.addTab(self.tab_power, "⚡ Target Power")
 
-        right_layout.addWidget(self.analytics_tabs, stretch=1)
+        # Tab 3: Height
+        self.tab_height  = QWidget()
+        height_tab_layout = QVBoxLayout(self.tab_height)
+        height_tab_layout.setContentsMargins(5, 5, 5, 5)
 
-        body_layout.addLayout(right_layout, stretch=1)
-        main_layout.addLayout(body_layout, stretch=4)
+        self.height_plot = self._create_plot("📏 Estimated Height (Z)", "Time (s)", "Height (m)")
+        self.height_plot.setXRange(-config.respiration.resp_window_sec, 0, padding=0)
+        self.height_plot.setYRange(0, 2.2)
+        self.height_plot.enableAutoRange(axis='x', enable=False)
+        self.height_plot.enableAutoRange(axis='y', enable=False)
+        self.curve_height = self.height_plot.plot(
+            pen=pg.mkPen(color=config.gui_theme.occupant, width=2), name="Z")
 
-        # 2. Bottom Cards
-        cards_layout = QHBoxLayout()
+        # Threshold lines
+        sit_thresh   = config.posture.sitting_threshold
+        stand_thresh = config.posture.standing_threshold
+        self._height_line_sit = pg.InfiniteLine(
+            pos=sit_thresh, angle=0,
+            pen=pg.mkPen(color="#F59E0B", width=1, style=Qt.PenStyle.DashLine),
+            label=f"Sitting (≥{sit_thresh:.1f} m)",
+            labelOpts={"color": "#F59E0B", "position": 0.96})
+        self.height_plot.addItem(self._height_line_sit)
 
-        # Set the gap between the cards (e.g., 20 pixels)
-        cards_layout.setSpacing(50)
+        self._height_line_stand = pg.InfiniteLine(
+            pos=stand_thresh, angle=0,
+            pen=pg.mkPen(color="#22C55E", width=1, style=Qt.PenStyle.DashLine),
+            label=f"Standing (≥{stand_thresh:.1f} m)",
+            labelOpts={"color": "#22C55E", "position": 0.96})
+        self.height_plot.addItem(self._height_line_stand)
 
-        self.occ_card = CardWidget("📍 Occupancy", ["Zone", "State", "Confidence", "Duration", "Target Power"])
+        height_tab_layout.addWidget(self.height_plot)
+        self.analytics_tabs.addTab(self.tab_height, "📏 Height")
+
+        # Tab 4: Posture Timeline
+        # Encodes posture strings as integers: Fallen=-1, Unknown=0, Lying=1, Sitting=2, Standing=3, Walking=4
+        _POSTURE_CODES = {"Fallen": -1, "Unknown": 0, "Lying Down": 1, "Sitting": 2, "Standing": 3, "Walking": 4}
+        _POSTURE_COLORS = {
+            "Fallen":     "#EF4444",
+            "Unknown":    "#6B7280",
+            "Lying Down": "#6366F1",
+            "Sitting":    "#14B8A6",
+            "Standing":   "#22C55E",
+            "Walking":    "#14B8A6",  # Teal, matching the map animation
+        }
+        self._posture_codes = _POSTURE_CODES   # keep ref for update_dashboard
+
+        self.tab_posture_tl  = QWidget()
+        posture_tl_layout = QVBoxLayout(self.tab_posture_tl)
+        posture_tl_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.posture_tl_plot = self._create_plot("🧐 Posture Timeline", "Time (s)", "")
+        self.posture_tl_plot.setXRange(-config.respiration.resp_window_sec, 0, padding=0)
+        self.posture_tl_plot.setYRange(-1.7, 4.7)
+        self.posture_tl_plot.enableAutoRange(axis='x', enable=False)
+        self.posture_tl_plot.enableAutoRange(axis='y', enable=False)
+
+        # Custom integer → label Y-axis ticks
+        ax_left = self.posture_tl_plot.getAxis('left')
+        ax_left.setTicks([[
+            (-1, "Fallen"), (0, "Unknown"), (1, "Lying"), (2, "Sitting"), (3, "Standing"), (4, "Walking")
+        ]])
+
+        # Colored reference lines for each posture level
+        for name, code in _POSTURE_CODES.items():
+            color = _POSTURE_COLORS[name]
+            ref_line = pg.InfiniteLine(
+                pos=code, angle=0,
+                pen=pg.mkPen(color=color, width=1, style=Qt.PenStyle.DotLine))
+            ref_line.setZValue(-10)
+            self.posture_tl_plot.addItem(ref_line)
+
+        # Step-function line showing posture over time
+        self.curve_posture_tl = self.posture_tl_plot.plot(
+            pen=pg.mkPen(color=config.gui_theme.occupant, width=2.5),
+            name="Posture")
+        # Current posture label annotation (top-right)
+        self._posture_tl_ann = pg.TextItem("", anchor=(1, 0), color=config.gui_theme.text)
+        self._posture_tl_ann.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.posture_tl_plot.addItem(self._posture_tl_ann)
+
+        posture_tl_layout.addWidget(self.posture_tl_plot)
+        self.analytics_tabs.addTab(self.tab_posture_tl, "🧐 Posture")
+
+        # Add analytics DIRECTLY below radar — 40% of right column height (stretch 3:2)
+        right_layout.addWidget(self.analytics_tabs, stretch=2)
+
+        # Assemble two-column layout and add to main
+        columns_layout.addLayout(left_col,    stretch=2)
+        columns_layout.addLayout(right_layout, stretch=1)
+        main_layout.addLayout(columns_layout, stretch=5)
+
+        # 2. Bottom Cards — in the left column, directly below vitals tabs
+        left_cards_widget = QWidget()
+        left_cards_layout = QHBoxLayout(left_cards_widget)
+        left_cards_layout.setContentsMargins(0, 0, 0, 0)
+        left_cards_layout.setSpacing(10)
+
+        self.occ_card  = CardWidget("📍 Occupancy", ["Zone", "State", "Confidence", "Duration", "Target Power"])
         self.post_card = PostureCard()
-        self.sys_card = CardWidget("⚙️ System", ["Radar", "Tracking", "Fall state", "Fall conf."])
-        # Set stretch ratios here. Example: 1 : 2 : 1 ratio
-        cards_layout.addWidget(self.occ_card, stretch=1) # Takes 25% of space
-        cards_layout.addWidget(self.post_card, stretch=2) # Takes 50% of space
-        cards_layout.addWidget(self.sys_card, stretch=1) # Takes 25% of space
+        left_cards_layout.addWidget(self.occ_card,  stretch=1)
+        left_cards_layout.addWidget(self.post_card, stretch=2)
 
-        main_layout.addLayout(cards_layout, stretch=1)
-
+        left_col.addWidget(left_cards_widget, stretch=1)
         # 3. Breathing Info Bar
         self.resp_info_bar = QLabel("🫁 Waiting for breathing data...")
         self.resp_info_bar.setStyleSheet(f"""
@@ -386,13 +490,61 @@ class MainWindow(QMainWindow):
         self.radar_plot.setYRange(room_y[0], room_y[1], padding=0)
 
     def _normalize_motion(self, motion_str):
-        s = (motion_str or "").lower()
-        if "still" in s: return 0.10
-        if "breath" in s: return 0.35
-        if "rest" in s: return 0.25
-        if "move" in s: return 0.75
-        if "active" in s: return 0.90
-        return 0.20
+        """Trend plot value: Walking=0.9, Moving=0.8, Resting=0.1, Unknown=0.2."""
+        cls, _ = _classify_motion(motion_str)
+        if cls == "Walking":  return 0.9
+        if cls == "Resting":  return 0.1
+        if cls == "Moving":   return 0.8
+        return 0.2
+
+    @staticmethod
+    def _classify_motion_display(mot_str: str, posture: str,
+                                 status: str, occ_conf: float) -> str:
+        """
+        Context-aware three-class motion label for display only.
+        Priority: Walk > Move > Static > '--'
+
+        Walk (highest priority):
+          motion_str == 'Walking'
+
+        Move:
+          motion_str in active labels
+          OR status contains 'Moving'
+          OR posture == 'Standing'
+          OR posture == 'Sitting' AND occupancy is valid (>0)
+
+        Static (only when clearly resting in bed-like state):
+          occupancy is valid
+          AND posture == 'Lying Down'
+          AND (motion_str is resting OR status is monitoring/apnea)
+        """
+        _MOVE_LABELS    = {"Major Movement", "Restless/Shifting",
+                           "Postural Shift", "Restless/Fidgeting"}
+        _STATIC_STATUS  = {"Still / Monitoring...", "Possible Apnea"}
+        occ_valid = occ_conf > 0
+
+        # 1. Walking
+        if mot_str == "Walking":
+            return "Walk"
+
+        # 2. Move
+        if (mot_str in _MOVE_LABELS
+                or "Moving" in (status or "")
+                or posture == "Standing"
+                or (posture == "Sitting" and occ_valid)):
+            return "Move"
+
+        # 3. Static — only when truly resting in monitored bed-like state
+        resting_mot = (mot_str or "").lower()
+        is_rest_str = any(kw in resting_mot
+                          for kw in ("breath", "rest", "still", "static"))
+        in_still_status = (status or "") in _STATIC_STATUS
+        if (occ_valid
+                and posture == "Lying Down"
+                and (is_rest_str or in_still_status)):
+            return "Static"
+
+        return "--"
 
     @pyqtSlot(float, float, float, float)
     def update_radar_fov(self, x, y, yaw_deg, fov_deg=120):
@@ -436,12 +588,17 @@ class MainWindow(QMainWindow):
                     rect.setBrush(pg.mkBrush(QColor(color).getRgb()[:3] + (base_alpha,)))
         
         state = occ_dict.get("status", "Waiting")
-        mot_str = occ_dict.get("motion_str", "--")
-        
+        mot_str     = occ_dict.get("motion_str", "--")
+        posture_str = occ_dict.get("posture", "--")
+        occ_conf    = occ_dict.get('occ_confidence', 0)
+        # Context-aware three-class display label (pipeline unchanged)
+        mot_display = self._classify_motion_display(
+            mot_str, posture_str, state, occ_conf)
+
         self.occ_card.update_values(
             Zone=zone,
             State=state[:20] + "..." if len(state)>20 else state,
-            Confidence=f"{int(occ_dict.get('occ_confidence', 0))}%",
+            Confidence=f"{int(occ_conf)}%",
             Duration=occ_dict.get("duration_str", "--"),
             **{"Target Power": f"{occ_dict.get('dynamic_mag', 0):.1f} / {occ_dict.get('detection_threshold', 150.0):.1f}"}
         )
@@ -449,23 +606,17 @@ class MainWindow(QMainWindow):
         z = occ_dict.get("Z")
         r = occ_dict.get("Range", 0.0)
         height_range_str = f"{z:.2f} m ({r:.2f} m)" if z else "--"
-        posture_str = occ_dict.get("posture", "--")
         posture_conf = occ_dict.get('posture_confidence', 0)
         self.post_card.update_values(
             Posture=posture_str,
             **{"Posture conf.": f"{int(posture_conf)}%"},
             **{"Height (Range)": height_range_str},
-            Motion=mot_str
+            Motion=mot_display
         )
+        # Pass mot_display as the motion class so the widget animation matches the label
         self.post_card.set_posture_state(posture_str, posture_conf, mot_str)
 
         fc = occ_dict.get('fall_confidence', 0)
-        self.sys_card.update_values(
-            Radar="Online",
-            Tracking="Good" if occ_dict.get('occ_confidence', 0) > 50 else "Weak",
-            **{"Fall state": "Fall Detected!" if fc > 80 else "Normal"},
-            **{"Fall conf.": f"{int(fc)}%"}
-        )
 
         # Update Colors
         if "apnea" in state.lower() or fc > 80:
@@ -494,6 +645,28 @@ class MainWindow(QMainWindow):
         self.fall_hist.pop(0)
         self.fall_hist.append(np.clip(fc/100.0, 0, 1))
         self.curve_fall.setData(self.x_axis, self.fall_hist)
+
+        # Update Height Trend
+        z_val = occ_dict.get("Z") or 0.0
+        self.height_hist.pop(0)
+        self.height_hist.append(float(z_val))
+        self.curve_height.setData(self.x_axis, self.height_hist)
+
+        # Update Posture Timeline
+        # For the timeline specifically, inject 'Walking' as the top-level state
+        # instead of the physical base posture ('Standing') to show locomotion segments.
+        tl_posture_str = "Walking" if mot_str == "Walking" else posture_str
+        posture_code = self._posture_codes.get(tl_posture_str, 0)
+        self.posture_num_hist.pop(0)
+        self.posture_num_hist.append(posture_code)
+        self.curve_posture_tl.setData(self.x_axis, self.posture_num_hist)
+        # Update annotation
+        tl_colors = {"Fallen": "#EF4444", "Unknown": "#6B7280",
+                     "Lying Down": "#6366F1", "Sitting": "#14B8A6", 
+                     "Standing": "#22C55E", "Walking": "#14B8A6"}
+        self._posture_tl_ann.setText(tl_posture_str or "Unknown")
+        self._posture_tl_ann.setColor(QColor(tl_colors.get(tl_posture_str, config.gui_theme.subtext)))
+        self._posture_tl_ann.setPos(0, 4.7)
 
         # Update Target Power Trends
         self.mag_hist.pop(0)
@@ -525,18 +698,26 @@ class MainWindow(QMainWindow):
             
             halo_color = QColor(base_color.red(), base_color.green(), base_color.blue(), alpha)
             
-            # Posture Graphic in monitored zones
+            # Posture Graphic: show in monitored zones OR when walking in transit
             zone = occ_dict.get("zone", "")
             base_zone = zone.split(" - ")[0]
-            if base_zone in config.layout and config.layout[base_zone].get("type") == "monitor":
-                self.scatter_occupant.setData([], [])  # Hide dot completely
-                self.radar_posture_item.setPos(x, y)   # Center exactly at target
-                self.radar_posture_item.set_state(occ_dict.get("posture", "Unknown"), occ_dict.get('posture_confidence', 0))
+            is_monitored = (base_zone in config.layout and
+                            config.layout[base_zone].get("type") == "monitor")
+            is_walking   = (mot_str == "Walking")
+
+            if is_monitored or is_walking:
+                self.scatter_occupant.setData([], [])  # Hide plain dot
+                self.radar_posture_item.setPos(x, y)
+                self.radar_posture_item.set_state(
+                    occ_dict.get("posture", "Unknown"),
+                    occ_dict.get('posture_confidence', 0),
+                    mot_str)
                 self.radar_posture_item.show()
             else:
-                # Outside monitored zones, show the standard dot
+                # Non-monitored, non-walking: standard confidence dot
                 self.radar_posture_item.hide()
                 self.scatter_occupant.setData(x=[x], y=[y], size=dot_diam, brush=pg.mkBrush(base_color))
+
                 
         else:
             self.scatter_occupant.setData([], [])

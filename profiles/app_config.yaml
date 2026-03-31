@@ -2,31 +2,45 @@ layout:
   Room:
     type: "boundary"
     x: [0, 2] #[0.0, 2.58]
-    y: [0, 2.5] #[0.0, 3.5]
+    y: [0, 3] #[0.0, 3.5]
     z: [0.0, 2.7]
     arm_move: [500, 500, 500, 500, 500, 500] # Default wide-view pose when empty
     radar_pose:
-      x: 0 
-      y: 0 
+      x: 1 
+      y: 3 
       z: 0.7 
-      yaw_deg: 55 
-      pitch_deg: -30
+      yaw_deg: 180 
+      pitch_deg: 0
       fov_deg: 120
   Bed:
     type: "monitor"
-    x: [0.55, 1.55]
-    y: [0.25, 2.3] 
+    x: [0.5, 1.5]
+    y: [0.5, 2.5] 
     z: [0.0, 2.0] # TODO: need to check the z bounds processing 
     margin_x: [0.2, 0.2]
     margin_y: [0.2, 0.2]
     arm_move: [500, 500, 200, 500, 500, 300] # motor positions
     radar_pose:
-      x: 0 
-      y: 0 
+      x: 1 
+      y: 3 
       z: 0.7 
-      yaw_deg: 55 
-      pitch_deg: -30 
+      yaw_deg: 180 
+      pitch_deg: 0 
       fov_deg: 120
+
+  # Fan:
+  #   type: "ignore"
+  #   x: [0, 0.5]
+  #   y: [1.5, 2] 
+  #   z: [0.0, 2.0] # TODO: need to check the z bounds processing 
+  #   arm_move: [500, 500, 200, 500, 500, 300] # motor positions
+  #   radar_pose:
+  #     x: 1 
+  #     y: 3 
+  #     z: 0.7 
+  #     yaw_deg: 225 
+  #     pitch_deg: -15 
+  #     fov_deg: 120
   # Desk:
   #   type: "ignore"
   #   x: [0.2, 0.6] #[1.95, 2.58]
@@ -93,8 +107,11 @@ radar:
   mac_data: "/dev/cu.usbserial-00E2410B1" #"/dev/cu.usbserial-00E2410B1" #"/dev/cu.usbserial-00E243021" #"/dev/cu.usbserial-00E242E71" 
   linux_cli: "/dev/ttyUSB0"
   linux_data: "/dev/ttyUSB1"
+  win_cli: "COM10"
+  win_data: "COM11"
 
 pipeline:
+  use_cfar: true
   detection_threshold: 150.0
   static_margin: 200
   alpha: 0.05
@@ -112,15 +129,19 @@ pipeline:
     fall_posture: true
 
 posture:
-  fall_detection_enable: true
+  fall_detection_enable: false
   fall_threshold: 0.5
   fall_velocity_threshold: -1.2
-  sitting_threshold: 0.6
-  standing_threshold: 1.1
+  sitting_threshold: 0.35
+  standing_threshold: 0.85
 
 motion:
   rest_max: 0.1
   restless_max: 0.3
+  # Walking detection: net XY displacement over a short window
+  walk_window_frames: 15       # look-back frames (~0.6 s at 25 fps)
+  walk_displacement_m: 0.30    # minimum net translation (m) to classify as Walking
+  walk_posture_conf: 90.0      # posture_confidence floor when walking is confirmed
 
 respiration:
   resp_window_sec: 30
@@ -167,7 +188,7 @@ tuning:
   macro_displacement_mm: 15.0
   z_clip_min: 0.05
   z_clip_max: 1.80
-  jump_reject_distance: 1.5
+  jump_reject_distance: 0.5
   warmup_seconds: 1.0
   entry_hold_seconds: 3.0
   reassess_seconds: 3.0
@@ -180,3 +201,32 @@ tuning:
   aliveness_threshold: 0.40
   breathing_displacement_min: 0.5
   breathing_displacement_max: 12.0
+
+  # Monitored-zone reflection continuity
+  # reflection_dip_tolerance: consecutive below-threshold frames allowed before track reset
+  #   25 frames = 1 second at 25 fps
+  reflection_dip_tolerance: 5
+  # continuity_ratio: fraction of occupied_reflection used as the floor threshold
+  #   0.60 gives more tolerance for posture/blanket variation than the old 0.70
+  continuity_ratio: 0.60
+  # fall_cooldown_frames: frames after leaving a non-floor zone before fall scoring re-enables
+  #   prevents nuisance "Fall aborted" logs during bed-exit / transit
+  fall_cooldown_frames: 25
+
+  # ── Display Stabilisation ─────────────────────────────────────────────────
+  # posture_hysteresis_m: entry/exit margin (m) around each posture threshold.
+  #   Prevents flickering when Z_b hovers near sitting_threshold / standing_threshold.
+  posture_hysteresis_m: 0.05
+
+  # transit_standing_bias_m: extra margin added to exit-Standing and enter-Sitting
+  #   thresholds when the track is in Floor / Transit.  Z_b is noisier there
+  #   (floor bounce, open space) so we bias strongly toward Standing.
+  transit_standing_bias_m: 0.08
+
+  # subzone_debounce_frames: majority-vote window for bed sub-zone labels only.
+  #   Longer than the coarse zone debounce so "Bed - Center" / "Bed - Edge" never flicker.
+  subzone_debounce_frames: 15
+
+  # bin_vote_window: majority-vote window for the *displayed* final_bin.
+  #   Internal tethering still uses the raw accepted bin for zero lag.
+  bin_vote_window: 7
