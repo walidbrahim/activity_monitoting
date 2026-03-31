@@ -6,6 +6,7 @@ from PyQt6.QtCore import pyqtSlot, Qt, QTimer
 from PyQt6.QtGui import QFont, QColor
 import pyqtgraph as pg
 from config import config
+from libs.gui.posture_widget import PostureCard, RadarPostureItem
 
 class CardWidget(QFrame):
     def __init__(self, title, lines):
@@ -26,7 +27,7 @@ class CardWidget(QFrame):
         layout.setContentsMargins(15, 15, 15, 15)
         
         self.title_lbl = QLabel(title)
-        self.title_lbl.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        self.title_lbl.setFont(QFont("Arial", 20, QFont.Weight.Bold))
         self.title_lbl.setStyleSheet(f"color: {config.gui_theme.text};")
         layout.addWidget(self.title_lbl)
         
@@ -34,9 +35,9 @@ class CardWidget(QFrame):
         for line in lines:
             row = QHBoxLayout()
             lbl_key = QLabel(line)
-            lbl_key.setStyleSheet(f"color: {config.gui_theme.subtext}; font-size: 15px;")
+            lbl_key.setStyleSheet(f"color: {config.gui_theme.subtext}; font-size: 20px;")
             lbl_val = QLabel("--")
-            lbl_val.setStyleSheet(f"color: {config.gui_theme.text}; font-size: 15px; font-weight: bold;")
+            lbl_val.setStyleSheet(f"color: {config.gui_theme.text}; font-size: 20px; font-weight: bold;")
             lbl_val.setAlignment(Qt.AlignmentFlag.AlignRight)
             row.addWidget(lbl_key)
             row.addWidget(lbl_val)
@@ -166,7 +167,7 @@ class MainWindow(QMainWindow):
 
         resp_layout.addWidget(self.rr_plot, stretch=2)
         
-        self.vitals_tabs.addTab(self.tab_resp, "🫁 Respiration")
+        self.vitals_tabs.addTab(self.tab_resp, "🫁 Respiratory Information")
 
         # Tab 2: Heart Rate (Placeholder)
         self.tab_hr = QWidget()
@@ -186,7 +187,7 @@ class MainWindow(QMainWindow):
         self.curve_hr_rate = self.hr_rate_plot.plot(pen=pg.mkPen(color=config.gui_theme.text, width=2))
         hr_layout.addWidget(self.hr_rate_plot, stretch=1)
 
-        self.vitals_tabs.addTab(self.tab_hr, "❤️ Heart Rate")
+        self.vitals_tabs.addTab(self.tab_hr, "❤️ Cardiac Information")
         
         body_layout.addWidget(self.vitals_tabs, stretch=2)
 
@@ -202,6 +203,11 @@ class MainWindow(QMainWindow):
         self.radar_plot.addItem(self.scatter_halo)
         self.scatter_occupant = pg.ScatterPlotItem(pxMode=False, pen=pg.mkPen(None))
         self.radar_plot.addItem(self.scatter_occupant)
+        
+        self.radar_posture_item = RadarPostureItem()
+        self.radar_posture_item.hide()
+        self.radar_plot.addItem(self.radar_posture_item)
+        
         right_layout.addWidget(self.radar_plot, stretch=3)
 
         # Analytics Tabs (Bottom Right)
@@ -258,12 +264,18 @@ class MainWindow(QMainWindow):
 
         # 2. Bottom Cards
         cards_layout = QHBoxLayout()
+
+        # Set the gap between the cards (e.g., 20 pixels)
+        cards_layout.setSpacing(50)
+
         self.occ_card = CardWidget("📍 Occupancy", ["Zone", "State", "Confidence", "Duration", "Target Power"])
-        self.post_card = CardWidget("🧍 Posture & Motion", ["Posture", "Posture conf.", "Height (Range)", "Motion"])
+        self.post_card = PostureCard()
         self.sys_card = CardWidget("⚙️ System", ["Radar", "Tracking", "Fall state", "Fall conf."])
-        cards_layout.addWidget(self.occ_card)
-        cards_layout.addWidget(self.post_card)
-        cards_layout.addWidget(self.sys_card)
+        # Set stretch ratios here. Example: 1 : 2 : 1 ratio
+        cards_layout.addWidget(self.occ_card, stretch=1) # Takes 25% of space
+        cards_layout.addWidget(self.post_card, stretch=2) # Takes 50% of space
+        cards_layout.addWidget(self.sys_card, stretch=1) # Takes 25% of space
+
         main_layout.addLayout(cards_layout, stretch=1)
 
         # 3. Breathing Info Bar
@@ -273,7 +285,7 @@ class MainWindow(QMainWindow):
             background-color: {config.gui_theme.card_bg};
             padding: 8px 15px;
             border-radius: 6px;
-            font-size: 13px;
+            font-size: 20px;
             border: 1px solid rgba(255, 255, 255, 0.08);
         """)
         self.resp_info_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -337,9 +349,10 @@ class MainWindow(QMainWindow):
                 self.zone_rects = {}
             self.zone_rects[name] = {"item": rect, "color": color, "base_alpha": 30 if btype == "ignore" else alpha}
             
-            text = pg.TextItem(name, anchor=(0.5, 0.5), color=config.gui_theme.text)
-            text.setPos(x_min + w/2, y_min + h/2)
-            self.radar_plot.addItem(text)
+            if "Room" not in name:
+                text = pg.TextItem(name, anchor=(0.5, 0.5), color=config.gui_theme.text)
+                text.setPos(x_min + w/2, y_min + h/2)
+                self.radar_plot.addItem(text)
             
         # Draw Default Radar Point & FOV (Using fallback chain)
         d_zone = getattr(config.app, "default_radar_pose", "Room")
@@ -436,12 +449,15 @@ class MainWindow(QMainWindow):
         z = occ_dict.get("Z")
         r = occ_dict.get("Range", 0.0)
         height_range_str = f"{z:.2f} m ({r:.2f} m)" if z else "--"
+        posture_str = occ_dict.get("posture", "--")
+        posture_conf = occ_dict.get('posture_confidence', 0)
         self.post_card.update_values(
-            Posture=occ_dict.get("posture", "--"),
-            **{"Posture conf.": f"{int(occ_dict.get('posture_confidence', 0))}%"},
+            Posture=posture_str,
+            **{"Posture conf.": f"{int(posture_conf)}%"},
             **{"Height (Range)": height_range_str},
             Motion=mot_str
         )
+        self.post_card.set_posture_state(posture_str, posture_conf, mot_str)
 
         fc = occ_dict.get('fall_confidence', 0)
         self.sys_card.update_values(
@@ -509,11 +525,23 @@ class MainWindow(QMainWindow):
             
             halo_color = QColor(base_color.red(), base_color.green(), base_color.blue(), alpha)
             
-            self.scatter_halo.setData(x=[x], y=[y], size=halo_diam, brush=pg.mkBrush(halo_color))
-            self.scatter_occupant.setData(x=[x], y=[y], size=dot_diam, brush=pg.mkBrush(base_color))
+            # Posture Graphic in monitored zones
+            zone = occ_dict.get("zone", "")
+            base_zone = zone.split(" - ")[0]
+            if base_zone in config.layout and config.layout[base_zone].get("type") == "monitor":
+                self.scatter_occupant.setData([], [])  # Hide dot completely
+                self.radar_posture_item.setPos(x, y)   # Center exactly at target
+                self.radar_posture_item.set_state(occ_dict.get("posture", "Unknown"), occ_dict.get('posture_confidence', 0))
+                self.radar_posture_item.show()
+            else:
+                # Outside monitored zones, show the standard dot
+                self.radar_posture_item.hide()
+                self.scatter_occupant.setData(x=[x], y=[y], size=dot_diam, brush=pg.mkBrush(base_color))
+                
         else:
             self.scatter_occupant.setData([], [])
             self.scatter_halo.setData([], [])
+            self.radar_posture_item.hide()
 
         # Update Respiratory
         if resp_dict and (resp_dict.get('confidence', 0) > 0 or resp_dict.get('is_calibrating', False)):

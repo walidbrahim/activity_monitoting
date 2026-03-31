@@ -1,58 +1,58 @@
 layout:
   Room:
     type: "boundary"
-    x: [0, 2.5] #[0.0, 2.58]
+    x: [0, 2] #[0.0, 2.58]
     y: [0, 2.5] #[0.0, 3.5]
     z: [0.0, 2.7]
     arm_move: [500, 500, 500, 500, 500, 500] # Default wide-view pose when empty
     radar_pose:
-      x: 2.5 #1.22
-      y: 0 #3.27
-      z: 0.7 #1.03
-      yaw_deg: -45 #180
+      x: 0 
+      y: 0 
+      z: 0.7 
+      yaw_deg: 55 
       pitch_deg: -30
       fov_deg: 120
   Bed:
     type: "monitor"
-    x: [1.5, 2.5]
-    y: [0, 2.3] #[1.45, 3.5]
+    x: [0.55, 1.55]
+    y: [0.25, 2.3] 
     z: [0.0, 2.0] # TODO: need to check the z bounds processing 
     margin_x: [0.2, 0.2]
     margin_y: [0.2, 0.2]
     arm_move: [500, 500, 200, 500, 500, 300] # motor positions
     radar_pose:
-      x: 2.5 #1.2
-      y: 0 #3.5
-      z: 0.72 #0.95
-      yaw_deg: -45 #210
-      pitch_deg: -30 #-35
+      x: 0 
+      y: 0 
+      z: 0.7 
+      yaw_deg: 55 
+      pitch_deg: -30 
       fov_deg: 120
-  Desk:
-    type: "ignore"
-    x: [0.2, 0.6] #[1.95, 2.58]
-    y: [2.2, 2.5] #[1.6, 2.64]
-    z: [0, 0.72] #[0.0, 1.2]
-    arm_move: [500, 500, 500, 500, 500, 500] # motor positions
-    radar_pose:
-      x: 2.5
-      y: 0
-      z: 0.72
-      yaw_deg: -45
-      pitch_deg: -30
-      fov_deg: 120
-  Chair:
-    type: "monitor"
-    x: [0.2, 0.6]
-    y: [1.8, 2.2]
-    z: [0.0, 1.2]
-    arm_move: [500, 500, 500, 500, 500, 600] # motor positions
-    radar_pose:
-      x: 2.5
-      y: 0
-      z: 0.72
-      yaw_deg: -45
-      pitch_deg: -30
-      fov_deg: 120
+  # Desk:
+  #   type: "ignore"
+  #   x: [0.2, 0.6] #[1.95, 2.58]
+  #   y: [2.2, 2.5] #[1.6, 2.64]
+  #   z: [0, 0.72] #[0.0, 1.2]
+  #   arm_move: [500, 500, 500, 500, 500, 500] # motor positions
+  #   radar_pose:
+  #     x: 2.5
+  #     y: 0
+  #     z: 0.72
+  #     yaw_deg: -45
+  #     pitch_deg: -30
+  #     fov_deg: 120
+  # Chair:
+  #   type: "monitor"
+  #   x: [0.2, 0.6]
+  #   y: [1.8, 2.2]
+  #   z: [0.0, 1.2]
+  #   arm_move: [500, 500, 500, 500, 500, 600] # motor positions
+  #   radar_pose:
+  #     x: 2.5
+  #     y: 0
+  #     z: 0.72
+  #     yaw_deg: -45
+  #     pitch_deg: -30
+  #     fov_deg: 120
   # Sofa:
   #   type: "monitor"
   #   x: [3.0, 3.6]
