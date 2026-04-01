@@ -449,6 +449,7 @@ class ActivityPipeline:
             self.output_dict["zone"]   = "Calibrating"
             self.output_dict["Range"]  = 0.0
             self.output_dict["X"], self.output_dict["Y"], self.output_dict["Z"] = 0, 0, 0
+            print(f"Pipeline warming up: {remaining} frames remaining")
             return {"abort": True}
 
         # Reset track state once immediately after warmup ends
@@ -510,6 +511,8 @@ class ActivityPipeline:
         peaks += min_search_bin
 
         if len(peaks) == 0:
+            if self.is_occupied:
+                print(f"Rejection: No peaks found above detection_threshold ({self.detection_threshold})")
             return {
                 "is_jump": False, "is_valid_point": False,
                 "final_peak_bin": None, "dynamic_peak_bin": min_search_bin,
@@ -629,7 +632,6 @@ class ActivityPipeline:
                 'vital_mult': vital_multiplier,
                 'micro_state': cand_micro_state
             })
-
         if valid_candidates:
             is_valid_point = True
             max_mag = max(c['mag'] for c in valid_candidates)
@@ -650,7 +652,7 @@ class ActivityPipeline:
                     is_valid_point = False
                     final_peak_bin = None
                     is_jump = True
-                    print(f"Jump reject: dist={jump_dist:.2f}m > {config.tuning.jump_reject_distance}m")
+                    print(f"Rejection: Jump reject! dist={jump_dist:.2f}m > {config.tuning.jump_reject_distance}m")
 
             # Only mutate shared state when the candidate is not rejected
             if is_valid_point:
@@ -694,6 +696,7 @@ class ActivityPipeline:
                 self.coord_buffer = deque([(raw_x, raw_y, raw_z)], maxlen=self.buffer_size)
             else:
                 self.track_confidence = 0
+                print("Rejection: Track lost (Persistence disabled)")
                 return {"abort": True, "kill_track": True}
         else:
             if is_valid_point:
@@ -704,10 +707,12 @@ class ActivityPipeline:
                 self.miss_counter += 1
                 if self.miss_counter > self.miss_allowance:
                     self.track_confidence = 0
-                    print("Missed too many frames, resetting track")
+                    print(f"Rejection: Missed too many frames ({self.miss_counter}/{self.miss_allowance}), resetting track")
                     return {"abort": True, "kill_track": True}
 
         if self.track_confidence < self.confidence_threshold:
+            if is_valid_point:
+                print(f"Rejection: Track not yet confirmed (Confidence {self.track_confidence}/{self.confidence_threshold})")
             return {"abort": True, "kill_track": False}
 
         recent_coords = np.array(list(self.coord_buffer))
@@ -796,7 +801,7 @@ class ActivityPipeline:
 
         # Ghost / ignored zone → kill track immediately
         if final_zone == "Out of Bounds (Ghost)" or final_zone.startswith("Ignored"):
-            print("Ghost or ignored zone detected, resetting track")
+            print(f"Rejection: Target in {final_zone}, resetting track")
             return {"abort": True, "kill_track": True}
 
         # ── Motion label ───────────────────────────────────────────────────────────
@@ -814,17 +819,23 @@ class ActivityPipeline:
 
         if is_walking:
             motion_str = "Walking"
+            # print(f"Walking: {self.motion_level}")
         elif self.motion_level > config.motion.restless_max:
             motion_str = "Major Movement"
+            # print(f"Major Movement: {self.motion_level}")
         elif getattr(self, 'current_micro_state', 'STABLE') == "MACRO_PHASE" and (
                 "Bed" in self.current_active_zone or "Chair" in self.current_active_zone):
             motion_str = "Postural Shift"
+            # print(f"Postural Shift: {self.motion_level}")
         elif self.motion_level > config.motion.rest_max:
             motion_str = "Restless/Shifting"
+            # print(f"Restless/Shifting: {self.motion_level}")
         elif getattr(self, 'current_micro_state', 'STABLE') == "MICRO_PHASE":
             motion_str = "Restless/Fidgeting"
+            # print(f"Restless/Fidgeting: {self.motion_level}")
         else:
             motion_str = "Resting/Breathing"
+            # print(f"Resting/Breathing: {self.motion_level}")
 
         if not getattr(self.features, 'fall_posture', True):
             return {"final_zone": final_zone, "posture": "Unknown", "motion_str": motion_str}
@@ -929,6 +940,7 @@ class ActivityPipeline:
             if not self.is_occupied:
                 self.entry_frames += 1
                 if self.entry_frames < self.frames_to_occupy:
+                    print(f"Rejection: Occupancy not yet stable (EntryFrames={self.entry_frames}/{self.frames_to_occupy})")
                     return {"abort": True}
             self.is_occupied        = True
             self.apnea_frames       = 0
@@ -977,7 +989,7 @@ class ActivityPipeline:
                 threshold = (self.occupied_reflection or 2000) * continuity_ratio
                 dip_tolerance = int(getattr(config.tuning, 'reflection_dip_tolerance',
                                             config.radar.frame_rate))  # default 1 sec
-                print(f"Step 5 Reflection Check: curr={current_raw_reflection:.0f}, base={self.occupied_reflection or 0.0:.0f}, thresh={threshold:.0f}, micro={micro}, dip={self._reflection_dip_frames}")
+                # print(f"Step 5 Reflection Check: curr={current_raw_reflection:.0f}, base={self.occupied_reflection or 0.0:.0f}, thresh={threshold:.0f}, micro={micro}, dip={self._reflection_dip_frames}")
 
                 if current_raw_reflection > threshold:
                     # Reflection is healthy — reset dip counter and run normal apnea logic.
@@ -1019,6 +1031,9 @@ class ActivityPipeline:
 
         else:
             # No existing track — nothing to persist.
+            # Only print if we were trying to detect something
+            if is_valid_point:
+                print("Rejection: Frame aborted – no existing track to persist candidate.")
             return {"abort": True, "kill_track": True}
 
         # ── 2. Confidence Indices ────────────────────────────────────────────

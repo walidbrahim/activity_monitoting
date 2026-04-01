@@ -8,9 +8,9 @@ layout:
     radar_pose:
       x: 1 
       y: 3 
-      z: 0.7 
+      z: 1.4 
       yaw_deg: 180 
-      pitch_deg: 0
+      pitch_deg: -45
       fov_deg: 120
   Bed:
     type: "monitor"
@@ -23,9 +23,9 @@ layout:
     radar_pose:
       x: 1 
       y: 3 
-      z: 0.7 
+      z: 1.4 
       yaw_deg: 180 
-      pitch_deg: 0 
+      pitch_deg: -45 
       fov_deg: 120
 
   # Fan:
@@ -154,6 +154,9 @@ respiration:
   cycle_tracker_history: 5
   bin_stability_sec: 2.0
 
+camera:
+  enabled: true
+  device_index: 0
 app:
   log_level: 10
   need_send_ti_config: true
@@ -188,7 +191,7 @@ tuning:
   macro_displacement_mm: 15.0
   z_clip_min: 0.05
   z_clip_max: 1.80
-  jump_reject_distance: 0.5
+  jump_reject_distance: 1
   warmup_seconds: 1.0
   entry_hold_seconds: 3.0
   reassess_seconds: 3.0

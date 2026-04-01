@@ -136,8 +136,13 @@ class GuiThemeConfig(BaseModel):
     radar: str
     origin: str
 
+class CameraConfig(BaseModel):
+    enabled: bool = True
+    device_index: int = 0
+
 class AppConfig(BaseModel):
     layout: Dict[str, Dict[str, Any]]
+    camera: CameraConfig = Field(default_factory=CameraConfig)
     pushover: PushoverConfig
     radar: RadarConfig
     pipeline: PipelineConfig

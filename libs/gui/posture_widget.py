@@ -266,7 +266,7 @@ POSTURE_PAINTERS = {
 }
 
 # ─── Motion classification (visualizer-only, no pipeline changes) ─────
-_RESTING_KEYWORDS = ("breath", "rest", "still", "static", "monitor", "apnea", "weak", "room")
+_RESTING_KEYWORDS = ("breath", "resting", "still", "static", "monitor", "apnea", "weak", "room")
 
 def _classify_motion(motion_str: str) -> tuple:
     """
@@ -282,9 +282,12 @@ def _classify_motion(motion_str: str) -> tuple:
         return "Unknown", 0.0
     if s == "walking":
         return "Walking", 95.0
-    for kw in _RESTING_KEYWORDS:
-        if kw in s:
-            return "Resting", 30.0
+    
+    # Check for specific resting keywords to catch calm states (Breathing, Monitoring, etc.)
+    # Note: 'resting' must be used instead of 'rest' to avoid matching 'restless' movement labels.
+    if any(kw in s for kw in _RESTING_KEYWORDS):
+        return "Resting", 30.0
+        
     return "Moving", 85.0
 
 

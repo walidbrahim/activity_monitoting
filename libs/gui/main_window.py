@@ -1,9 +1,11 @@
 import sys
 import numpy as np
+import cv2
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QGridLayout, QLabel, QFrame, QApplication, QGraphicsRectItem, QTabWidget)
-from PyQt6.QtCore import pyqtSlot, Qt, QTimer
-from PyQt6.QtGui import QFont, QColor
+                             QGridLayout, QLabel, QFrame, QApplication, QGraphicsRectItem, QTabWidget,
+                             QSizePolicy)
+from PyQt6.QtCore import pyqtSlot, Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QColor, QImage, QPixmap
 import pyqtgraph as pg
 from config import config
 from libs.gui.posture_widget import PostureCard, RadarPostureItem, _classify_motion
@@ -61,6 +63,34 @@ class CardWidget(QFrame):
                 background-color: transparent;
             }}
         """)
+
+class CameraThread(QThread):
+    frame_ready = pyqtSignal(np.ndarray)
+
+    def __init__(self, device_index=0):
+        super().__init__()
+        self.device_index = device_index
+        self._is_running = True
+
+    def run(self):
+        cap = cv2.VideoCapture(self.device_index)
+        if not cap.isOpened():
+            print(f"Warning: Could not open camera {self.device_index}")
+            return
+            
+        while self._is_running:
+            ret, frame = cap.read()
+            if ret:
+                self.frame_ready.emit(frame)
+            else:
+                self.msleep(100) # retry or throttle if camera hangs
+            self.msleep(30) # ~30 fps cap
+            
+        cap.release()
+
+    def stop(self):
+        self._is_running = False
+        self.wait()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -362,6 +392,27 @@ class MainWindow(QMainWindow):
         posture_tl_layout.addWidget(self.posture_tl_plot)
         self.analytics_tabs.addTab(self.tab_posture_tl, "🧐 Posture")
 
+        # Tab 5: Camera Feed
+        if getattr(config, 'camera', None) and config.camera.enabled:
+            self.tab_camera = QWidget()
+            cam_layout = QVBoxLayout(self.tab_camera)
+            cam_layout.setContentsMargins(5, 5, 5, 5)
+
+            self.camera_label = QLabel("📷 No feed available")
+            self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.camera_label.setStyleSheet(f"color: {config.gui_theme.subtext}; font-size: 20px; background-color: {config.gui_theme.panel_bg};")
+            self.camera_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+            self.camera_label.setMinimumSize(1, 1)
+            cam_layout.addWidget(self.camera_label)
+
+            self.analytics_tabs.addTab(self.tab_camera, "📷 Camera")
+
+            self.camera_thread = CameraThread(device_index=config.camera.device_index)
+            self.camera_thread.frame_ready.connect(self._update_camera_frame)
+            self.camera_thread.start()
+        else:
+            self.camera_thread = None
+
         # Add analytics DIRECTLY below radar — 40% of right column height (stretch 3:2)
         right_layout.addWidget(self.analytics_tabs, stretch=2)
 
@@ -376,7 +427,8 @@ class MainWindow(QMainWindow):
         left_cards_layout.setContentsMargins(0, 0, 0, 0)
         left_cards_layout.setSpacing(10)
 
-        self.occ_card  = CardWidget("📍 Occupancy", ["Zone", "State", "Confidence", "Duration", "Target Power"])
+        # self.occ_card  = CardWidget("📍 Occupancy", ["Zone", "State", "Confidence", "Duration", "Target Power"])
+        self.occ_card  = CardWidget("📍 Occupancy", ["Zone", "Confidence", "Duration", "Target Power"])
         self.post_card = PostureCard()
         left_cards_layout.addWidget(self.occ_card,  stretch=1)
         left_cards_layout.addWidget(self.post_card, stretch=2)
@@ -407,6 +459,27 @@ class MainWindow(QMainWindow):
         p.getAxis('bottom').setTextPen(config.gui_theme.subtext)
         p.getAxis('left').setTextPen(config.gui_theme.subtext)
         return p
+
+    def closeEvent(self, event):
+        if hasattr(self, 'camera_thread') and self.camera_thread is not None:
+            self.camera_thread.stop()
+        super().closeEvent(event)
+
+    @pyqtSlot(np.ndarray)
+    def _update_camera_frame(self, frame):
+        if not hasattr(self, 'camera_label'): return
+        
+        # Convert BGR to RGB
+        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        
+        qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_img)
+        
+        # Scale pixmap to fit the label without distorting aspect ratio
+        scaled_pixmap = pixmap.scaled(self.camera_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self.camera_label.setPixmap(scaled_pixmap)
 
     def _zone_color(self, zone_type):
         return getattr(config.gui_theme, zone_type, "#64748B")
@@ -520,7 +593,7 @@ class MainWindow(QMainWindow):
         """
         _MOVE_LABELS    = {"Major Movement", "Restless/Shifting",
                            "Postural Shift", "Restless/Fidgeting"}
-        _STATIC_STATUS  = {"Still / Monitoring...", "Possible Apnea"}
+        _STATIC_STATUS  = {"Still / Monitoring...", "Possible Apnea", "Resting/Breathing"}
         occ_valid = occ_conf > 0
 
         # 1. Walking
@@ -528,19 +601,21 @@ class MainWindow(QMainWindow):
             return "Walk"
 
         # 2. Move
-        if (mot_str in _MOVE_LABELS
-                or "Moving" in (status or "")
-                or posture == "Standing"
-                or (posture == "Sitting" and occ_valid)):
+        # Only trigger 'Move' if specifically restless or shift labels are present, 
+        # or if standing. Generic 'Occupied' status which contains 'Moving' is ignored.
+        is_restless = mot_str in _MOVE_LABELS or any(kw in (status or "") for kw in ["Major Movement", "Shift", "Fidgeting"])
+        
+        if is_restless or posture == "Standing":
             return "Move"
 
-        # 3. Static — only when truly resting in monitored bed-like state
+        # 3. Static — when resting in either Sitting or Lying Down postures
         resting_mot = (mot_str or "").lower()
         is_rest_str = any(kw in resting_mot
-                          for kw in ("breath", "rest", "still", "static"))
-        in_still_status = (status or "") in _STATIC_STATUS
+                          for kw in ("breathing", "resting", "still", "static"))
+        in_still_status = any(kw in (status or "") for kw in ["Still", "Monitoring", "Apnea", "Resting"])
+        
         if (occ_valid
-                and posture == "Lying Down"
+                and (posture in ["Lying Down", "Sitting"])
                 and (is_rest_str or in_still_status)):
             return "Static"
 
@@ -592,12 +667,13 @@ class MainWindow(QMainWindow):
         posture_str = occ_dict.get("posture", "--")
         occ_conf    = occ_dict.get('occ_confidence', 0)
         # Context-aware three-class display label (pipeline unchanged)
+        
         mot_display = self._classify_motion_display(
             mot_str, posture_str, state, occ_conf)
 
         self.occ_card.update_values(
             Zone=zone,
-            State=state[:20] + "..." if len(state)>20 else state,
+            # State=state[:20] + "..." if len(state)>20 else state,
             Confidence=f"{int(occ_conf)}%",
             Duration=occ_dict.get("duration_str", "--"),
             **{"Target Power": f"{occ_dict.get('dynamic_mag', 0):.1f} / {occ_dict.get('detection_threshold', 150.0):.1f}"}
