@@ -17,9 +17,11 @@ class ProcessorThread(QThread):
     # Emits (activity_output_dict, respiratory_output_dict)
     data_ready = pyqtSignal(dict, dict)
 
-    def __init__(self, pt_fft_q, parent=None):
+    def __init__(self, pt_fft_q, vernier_belt_realtime_q=None, vernier_belt_connection_q=None, parent=None):
         super().__init__(parent)
         self.pt_fft_q = pt_fft_q
+        self.vernier_belt_realtime_q = vernier_belt_realtime_q
+        self.vernier_belt_connection_q = vernier_belt_connection_q
         self.running = True
         self._pipeline_lock = threading.Lock()
         
@@ -27,9 +29,37 @@ class ProcessorThread(QThread):
         self.act_pipeline = ActivityPipeline(config.radar.range_idx_num, config.radar.range_resolution)
         self.resp_pipeline = RespiratoryPipelineV2()
 
+        # Vernier Belt History
+        self.belt_window_frames = int(config.respiration.resp_window_sec * config.vernier.rate_hz)
+        self.belt_history = np.zeros(self.belt_window_frames)
+        self.belt_samples_total = 0
+        self.belt_connected = False
+
     def run(self):
         while self.running:
             try:
+                # 0. Process Vernier Belt Data (Non-blocking)
+                if self.vernier_belt_realtime_q:
+                    belt_new_data = []
+                    while not self.vernier_belt_realtime_q.empty():
+                        try:
+                            val = self.vernier_belt_realtime_q.get_nowait()
+                            belt_new_data.append(val)
+                        except queue.Empty:
+                            break
+                    
+                    if belt_new_data:
+                        self.belt_history = np.roll(self.belt_history, -len(belt_new_data))
+                        self.belt_history[-len(belt_new_data):] = belt_new_data
+                        self.belt_samples_total += len(belt_new_data)
+
+                if self.vernier_belt_connection_q:
+                    while not self.vernier_belt_connection_q.empty():
+                        try:
+                            self.belt_connected = bool(self.vernier_belt_connection_q.get_nowait())
+                        except queue.Empty:
+                            break
+
                 # 1. Block and wait for at least one frame (timeout so it can exit on stop())
                 fft_frame = self.pt_fft_q.get(timeout=0.1)
 
@@ -67,6 +97,12 @@ class ProcessorThread(QThread):
                         if self.resp_pipeline.frames_since_present > 0:
                             logger.debug("Off-zone reset. Clearing respiratory ghost memory.")
                         self.resp_pipeline._reset_state()
+
+                    # Add Belt Data to resp_dict for GUI
+                    if resp_dict is not None:
+                        resp_dict['belt_history'] = self.belt_history.copy()
+                        resp_dict['belt_samples_total'] = self.belt_samples_total
+                        resp_dict['belt_connected'] = self.belt_connected
 
                 # Push results to UI thread cleanly via Qt Signal
                 self.data_ready.emit(occ_out_dict, resp_dict or {})

@@ -273,6 +273,12 @@ class ActivityPipeline:
                 else:
                     if xy_dist > 0.15: 
                         s -= min(0.4, (xy_dist - 0.15) * 0.4)
+
+                    # Strategy C: mild Z-elevation bonus for torso-height candidates
+                    # in Floor / Transit, where floor bounce depresses Z estimates.
+                    transit_z_bonus = float(getattr(config.tuning, 'posture_transit_z_bonus', 0.15))
+                    if c['zone'] == 'Floor / Transit' and 0.4 <= c['z'] <= 1.4:
+                        s += transit_z_bonus
                     
                 z_jump = abs(c['z'] - self.track_z)
                 s -= min(0.3, z_jump * 0.5)
@@ -680,7 +686,8 @@ class ActivityPipeline:
         return {
             "is_jump": is_jump, "is_valid_point": is_valid_point,
             "dynamic_peak_bin": dynamic_peak_bin,
-            "raw_x": raw_x, "raw_y": raw_y, "raw_z": raw_z
+            "raw_x": raw_x, "raw_y": raw_y, "raw_z": raw_z,
+            "valid_candidates": valid_candidates,  # exported for posture proxy (Strategy A)
         }
 
     def _step3_tracking(self, is_valid_point, raw_x, raw_y, raw_z):
@@ -772,12 +779,38 @@ class ActivityPipeline:
 
         return {"X_b": self.track_x, "Y_b": self.track_y, "Z_b": self.track_z, "v_z": v_z}
 
-    def _step4_activity_inference(self, X_b, Y_b, Z_b, v_z):
+    def _step4_activity_inference(self, X_b, Y_b, Z_b, v_z, valid_candidates=None):
         """
         Step 4 — Activity Inference.
         Translates the smoothed 3-D position into a confirmed zone, posture
         label, and motion string. Ghost / ignored zones kill the track.
+
+        Strategy A: posture classification uses the highest-Z candidate within
+        `posture_z_neighborhood_m` of the tracked XY position instead of the
+        EMA-smoothed Z_b. This avoids the strong-low-reflector bias that causes
+        the tracker to underestimate chest height when standing.
         """
+        # ── Strategy A: Posture Height Proxy ─────────────────────────────────
+        neighborhood_r = float(getattr(config.tuning, 'posture_z_neighborhood_m', 0.30))
+        posture_z_bias = float(getattr(config.tuning, 'posture_z_bias', 0.0))
+
+        posture_z = Z_b  # default fallback
+        if valid_candidates and self.track_x is not None:
+            nearby = [
+                c for c in valid_candidates
+                if np.sqrt((c['x'] - self.track_x)**2 + (c['y'] - self.track_y)**2)
+                   <= neighborhood_r
+            ]
+            if nearby:
+                posture_z = max(c['z'] for c in nearby)
+                logger.debug(
+                    "PostureProxy: highest-Z in %.2fm neighbourhood = %.3fm (track_z=%.3fm, %d candidates)",
+                    neighborhood_r, posture_z, Z_b, len(nearby)
+                )
+
+        posture_z = np.clip(posture_z + posture_z_bias,
+                            config.tuning.z_clip_min, config.tuning.z_clip_max)
+
         final_zone, _ = self.evaluate_spatial_zone(X_b, Y_b, Z_b)
 
         # Normalise to base zone before writing to zone_history so that
@@ -880,6 +913,7 @@ class ActivityPipeline:
             elif Z_b > sit_hi:
                 self._stable_posture = "Sitting"
 
+
         posture = self._stable_posture
 
         # ── Bed sub-zone debounce ─────────────────────────────────────────────
@@ -900,7 +934,8 @@ class ActivityPipeline:
             self._subzone_history.clear()
             self._stable_subzone_label = ""
 
-        return {"final_zone": final_zone, "posture": posture, "motion_str": motion_str}
+        return {"final_zone": final_zone, "posture": posture, "motion_str": motion_str,
+                "posture_z": posture_z}
 
     def _step5_alert_logic(self, is_valid_point, is_jump, dynamic_peak_bin,
                            dynamic_mag_profile, raw_mag_profile,
@@ -1167,7 +1202,10 @@ class ActivityPipeline:
             return self.output_dict
 
         # ── Step 4: Activity Inference (Zone, Posture, Motion) ───────────────
-        s4 = self._step4_activity_inference(s3["X_b"], s3["Y_b"], s3["Z_b"], s3["v_z"])
+        s4 = self._step4_activity_inference(
+            s3["X_b"], s3["Y_b"], s3["Z_b"], s3["v_z"],
+            valid_candidates=s2.get("valid_candidates", [])
+        )
         if s4.get("abort"):
             if s4.get("kill_track"):
                 self._reset_track()
@@ -1220,6 +1258,7 @@ class ActivityPipeline:
 
         self.output_dict.update({
             "X": s3["X_b"], "Y": s3["Y_b"], "Z": s3["Z_b"],
+            "posture_z": s4.get("posture_z", s3["Z_b"]),   # highest-Z proxy for posture
             "final_bin":           self._stable_bin if self._stable_bin is not None else self._last_valid_bin,
             "dynamic_mag":         self._last_valid_dynamic_mag,
             "detection_threshold": self.detection_threshold,
@@ -1233,6 +1272,7 @@ class ActivityPipeline:
             "fall_confidence":     s5["fall_confidence"],
             "micro_state":         getattr(self, 'current_micro_state', 'STABLE'),
             "spectral_history":    ordered_spectral,
+            "raw_spectral_cube":   raw3d,
             "is_valid":            True,
         })
         return self.output_dict

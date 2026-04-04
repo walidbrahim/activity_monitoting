@@ -205,6 +205,12 @@ class RespiratoryPipeline:
         self.locked_bin = None
         self.frames_since_present = 0
 
+        # State Machine Flags
+        self.state = "OFF"
+        self.stable_resp_frames = 0
+        self.acquire_frames = int(2.0 * self.fps)
+        self._apnea_timer = 0
+        
         # Stateful trackers
         self.apnea_tracker = ApneaTracker()
         self.cycle_tracker = BreathCycleTracker(
@@ -213,235 +219,277 @@ class RespiratoryPipeline:
         )
         self._global_frame_idx = 0
 
-        # Bin stability gating
-        self._prev_locked_bin = None
-        self._bin_stable_frames = 0
-        self._bin_stability_threshold = int(
-            getattr(config.respiration, 'bin_stability_sec', 2.0) * self.fps
-        )
-
     def process(self, act_pipe_out_dict, frames=1):
         """
-        act_pipe_out_dict: Output dictionary from ActivityPipeline containing bin and history
+        Activity-gated respiration processing.
         """
-        current_bin = act_pipe_out_dict['final_bin']
-        motion_str = act_pipe_out_dict['motion_str']
-
-        # Track global frame index for trackers
         self._global_frame_idx += frames
 
-        # 1. Target Lock (Hysteresis)
-        if self.locked_bin is None or motion_str == "MACRO_PHASE":
-            self.locked_bin = current_bin
+        # 1. Extract activity gates from act_pipe_out_dict
+        zone_str = act_pipe_out_dict.get("zone", "No Occupant Detected")
+        base_zone = zone_str.split(" - ")[0]
+        subzone   = zone_str.split(" - ")[1] if " - " in zone_str else ""
+        
+        # Monitor type check (feedback: enabled in any zone of type "monitor")
+        is_monitor = config.layout.get(base_zone, {}).get("type", "") == "monitor"
+        
+        posture = act_pipe_out_dict.get("posture", "")
+        motion  = act_pipe_out_dict.get("motion_str", "")
+        micro   = act_pipe_out_dict.get("micro_state", "STABLE")
+        occ_conf = act_pipe_out_dict.get("occ_confidence", 0)
 
-        # Bin stability tracking
-        if self._prev_locked_bin is not None and self.locked_bin != self._prev_locked_bin:
-            self._bin_stable_frames = 0  # Reset on bin change
-        elif self._bin_stable_frames < self._bin_stability_threshold:
-            self._bin_stable_frames += frames
-        self._prev_locked_bin = self.locked_bin
+        track_ok = (
+            act_pipe_out_dict.get("is_valid", False) and
+            act_pipe_out_dict.get("final_bin") is not None and
+            occ_conf >= 50 and
+            micro not in {"STATIC_GHOST", "MECHANICAL_ROTOR", "DEAD_SPACE"}
+        )
 
-        is_bin_unstable = self._bin_stable_frames < self._bin_stability_threshold
+        # Full Respiration Eligibility: Monitor Zone + Lying Down + Resting
+        full_resp_ok = (
+            track_ok and
+            is_monitor and
+            posture == "Lying Down" and
+            motion == "Resting/Breathing"
+        )
+        
+        # RR-only Eligibility: Monitor Zone + (Lying/Sitting) + (Resting/Fidgeting)
+        rr_only_ok = (
+            track_ok and
+            is_monitor and
+            posture in {"Lying Down", "Sitting"} and
+            motion in {"Resting/Breathing", "Restless/Fidgeting"}
+        )
 
-        # 2. Multi-Bin Spatial Fusion
-        spectral_hist = act_pipe_out_dict['spectral_history']
-        start_bin = max(0, self.locked_bin - 1)
-        end_bin = min(spectral_hist.shape[0], self.locked_bin + 2)
+        # 2. State Machine Transitions
+        prev_state = self.state
+        if not track_ok:
+            self.state = "OFF"
+            self._reset_state_soft()
+        elif full_resp_ok or rr_only_ok:
+            if self.stable_resp_frames >= self.acquire_frames:
+                self.locked_bin = act_pipe_out_dict["final_bin"]
+                self.state = "TRACK"
+            else:
+                self.state = "ACQUIRE"
+            self.stable_resp_frames += frames
+        elif motion == "Postural Shift":
+            self.state = "HOLD"
+        elif motion in {"Major Movement", "Walking"} or posture in {"Standing", "Fallen"} or not is_monitor:
+            self.state = "SUSPEND"
+            self.stable_resp_frames = 0
+        else:
+            self.state = "OFF"
+            self._reset_state_soft()
 
-        fused_complex = np.sum(spectral_hist[start_bin:end_bin, :], axis=0)
+        is_active = self.state in ["TRACK", "HOLD"]
 
-        # 3. Phase unwrapping → differentiation → lowpass → displacement (mm)
+        # Reset if moving from active to non-active states sharply
+        if prev_state in ["TRACK", "HOLD"] and self.state in ["OFF"]:
+            self._reset_state_soft()
+
+        # 3. Signal Extraction (Beamformed per-antenna extraction)
+        fused_complex = np.zeros(frames, dtype=complex)
+        
+        if is_active and self.locked_bin is not None:
+            raw_cube = act_pipe_out_dict.get('raw_spectral_cube')
+                
+            if raw_cube is not None:
+                # time-ordered raw spectral cube: (bins, antennas, frames)
+                # Use phase-aligned coherent sum across antennas
+                snapshot = raw_cube[self.locked_bin, :, -1]
+                weights = np.conj(snapshot) / (np.abs(snapshot) + 1e-9)
+
+                # Beamformed complex time series for target and neighbors
+                bf_center = np.sum(raw_cube[self.locked_bin, :, :] * weights[:, None], axis=0)
+                bf_left   = np.sum(raw_cube[max(0, self.locked_bin - 1), :, :] * weights[:, None], axis=0)
+                bf_right  = np.sum(raw_cube[min(raw_cube.shape[0]-1, self.locked_bin + 1), :, :] * weights[:, None], axis=0)
+
+                # Spatial smoothing (1-2-1 bin weighting)
+                fused_complex = 0.25 * bf_left + 0.50 * bf_center + 0.25 * bf_right
+            else:
+                # Fallback to summed history (legacy)
+                spectral_hist = act_pipe_out_dict.get('spectral_history')
+                if spectral_hist is not None:
+                    start_bin = max(0, self.locked_bin - 1)
+                    end_bin = min(spectral_hist.shape[0], self.locked_bin + 2)
+                    fused_complex = np.sum(spectral_hist[start_bin:end_bin, :], axis=0)
+
+        # 4. Signal Chain: Unwrap → Detrend → Bandpass
+        if len(fused_complex) == 0:
+            fused_complex = np.array([1e-10+1e-10j]*frames)
+
         raw_phase = np.unwrap(np.angle(fused_complex))
-
-        # Phase differencing (removes DC, preserves breathing dynamics)
-        # Prepend 0 to maintain array length (first sample has no prior reference)
         diff_phase = np.concatenate(([0.0], np.diff(raw_phase)))
 
-        # SQI calculation on differentiated signal
+        # SQI (Spectral Quality Index)
         win = np.hanning(len(diff_phase))
         fft_mag = np.abs(np.fft.rfft(diff_phase * win))
         freqs = np.fft.rfftfreq(len(diff_phase), d=(1.0 / self.fps))
-
-        breathing_mask = (freqs >= 0.15) & (freqs <= 0.5)
+        breathing_mask = (freqs >= 0.15) & (freqs <= 0.6)
         total_mask = (freqs >= 0.15) & (freqs <= 3.0)
-
         sqi = np.sum(fft_mag[breathing_mask]) / (np.sum(fft_mag[total_mask]) + 1e-6)
 
-        # Confidence Metric Evaluation
-        if motion_str == "MACRO_PHASE":
-            self.confidence = 0.0
-        elif motion_str == "MICRO_PHASE":
-            self.confidence = min(30.0, sqi * 100)
-        else:  # STABLE
-            self.confidence = min(100.0, sqi * 200)
+        # 5. Fused Confidence
+        zone_w = {
+            "Center": 1.0, "Head Edge": 0.95, "Left Edge": 0.85, 
+            "Right Edge": 0.85, "Foot Edge": 0.65, "Corner": 0.60
+        }.get(subzone, 0.8 if is_monitor else 0.0)
+        posture_w = {"Lying Down": 1.0, "Sitting": 0.55}.get(posture, 0.0)
+        motion_w = {
+            "Resting/Breathing": 1.0, "Restless/Fidgeting": 0.65, "Restless/Shifting": 0.35,
+            "Postural Shift": 0.10, "Major Movement": 0.0, "Walking": 0.0,
+        }.get(motion, 0.0)
 
-        # 4th-order lowpass at upper breathing frequency
+        gate_conf = zone_w * posture_w * motion_w
+        if not is_active: gate_conf = 0.0
+        signal_conf = np.clip(sqi * 100, 0, 100)
+
+        self.confidence = (0.45 * signal_conf + 0.35 * occ_conf + 0.20 * (100.0 * gate_conf))
+        if self.state in ["OFF", "SUSPEND"]: self.confidence = 0.0
+
+        # 6. Filtering & Displacement
         lp_cutoff = getattr(config.respiration, 'resp_lowpass_cutoff', 0.5)
         lp_order = getattr(config.respiration, 'resp_lowpass_order', 4)
         b, a = signal.butter(lp_order, lp_cutoff, btype='low', fs=self.fps)
-        filtered_velocity = signal.filtfilt(b, a, diff_phase)
+        
+        if len(diff_phase) > 15:
+            filtered_velocity = signal.filtfilt(b, a, diff_phase)
+        else:
+            filtered_velocity = diff_phase
 
-        # Integrate velocity back to displacement (cumsum recovers phase from diff)
         integrated_phase = np.cumsum(filtered_velocity)
-        # Remove linear drift that accumulates from integration
         integrated_phase = signal.detrend(integrated_phase, type='linear')
-
-        # Convert phase to displacement in mm (λ = 5mm for 60GHz FMCW)
         filtered_resp = integrated_phase * self.PHASE_TO_MM  # mm
-
-        # Window to live display size
         live_signal = filtered_resp[-self.window_frames:]
 
-        # Mask out "ghost" phases before the subject physically sat down
+        # Zero signal if unconfident or inactive
         self.frames_since_present += frames
-        if self.frames_since_present < self.window_frames:
-            live_signal[:-self.frames_since_present] = 0.0
+        if self.frames_since_present < self.window_frames or not is_active:
+            if not is_active: live_signal[:] = 0.0
+            else: live_signal[:-self.frames_since_present] = 0.0
 
-        # Update Long-term baseline history (only when confident)
-        if self.confidence > 40.0:
-            self.history_buffer = np.roll(self.history_buffer, -len(filtered_resp))
-            self.history_buffer[-len(filtered_resp):] = filtered_resp
+        # 7. Baseline History Update (Limited)
+        if self.state == "TRACK" and full_resp_ok and self.confidence > 40.0:
+            self.history_buffer = np.roll(self.history_buffer, -frames)
+            self.history_buffer[-frames:] = filtered_resp[-frames:]
 
-        # Gate: require minimum warmup time before detecting apnea (avoids false trigger from zero buffer)
-        min_warmup_frames = int(5.0 * self.fps)  # 5 seconds
+        # 8. Apnea Logic (Split into pause/event)
+        norm_derivative = np.zeros_like(live_signal)
+        apnea_segments  = []
+        apnea_status    = "normal"
+
+        apnea_eligible = (
+            is_monitor and 
+            posture == "Lying Down" and 
+            motion == "Resting/Breathing" and
+            self.state == "TRACK"
+        )
+        
+        min_warmup_frames = int(5.0 * self.fps)
         has_warmup = self.frames_since_present > min_warmup_frames
 
-        # --- Normalized Derivative & Apnea Segment Detection ---
-        apnea_segments = []
-        norm_derivative = np.zeros_like(live_signal)
-
-        if has_warmup:
+        if has_warmup and is_active:
             first_derivative = np.gradient(live_signal)
             abs_derivative = np.abs(first_derivative)
-
-            # Normalize against baseline derivative (from history buffer, only updates during confident breathing)
-            # This prevents per-frame rescaling that inflates noise during apnea
             baseline_deriv = np.max(np.abs(np.gradient(self.history_buffer[-self.window_frames:])))
             if baseline_deriv > 1e-6:
                 norm_derivative = np.clip(abs_derivative / baseline_deriv, 0.0, 1.0)
-            # else: stays zeros
 
-            # Apnea Segment Detection (threshold-based on normalized derivative)
             resp_thresh = getattr(config.respiration, 'resp_threshold', 0.15)
             hold_window = int(getattr(config.respiration, 'apnea_hold_window_sec', 3.0) * self.fps)
-            merge_gap = int(getattr(config.respiration, 'apnea_merge_gap_sec', 0.5) * self.fps)
+            merge_gap   = int(getattr(config.respiration, 'apnea_merge_gap_sec', 0.5) * self.fps)
 
             raw_apnea_segments = []
             for i in range(hold_window, len(norm_derivative)):
-                windowing_data = norm_derivative[i - hold_window:i]
-                if np.all(windowing_data <= resp_thresh):
-                    raw_apnea_segments.append((i - hold_window, i))
+                if np.all(norm_derivative[i-hold_window:i] <= resp_thresh):
+                    raw_apnea_segments.append((i-hold_window, i))
 
-            # Merge overlapping/adjacent segments
             if raw_apnea_segments:
                 cur_start, cur_end = raw_apnea_segments[0]
                 for s, e in raw_apnea_segments[1:]:
-                    if s - cur_end <= merge_gap:
-                        cur_end = e
+                    if s - cur_end <= merge_gap: cur_end = e
                     else:
                         apnea_segments.append((cur_start, cur_end))
                         cur_start, cur_end = s, e
                 apnea_segments.append((cur_start, cur_end))
 
-        # --- Scale-Invariant Apnea State Detection ---
+        # Apnea State machine
         self.apnea_trace = np.roll(self.apnea_trace, -frames)
         self.apnea_trace[-frames:] = False
-
-        if motion_str != "MACRO_PHASE" and has_warmup:
+        
+        if self.state == "HOLD":
+            pass
+        elif apnea_eligible and has_warmup and self.confidence >= 50.0:
             recent_signal = self.history_buffer[-int(5 * self.fps):]
             signal_mean_abs = np.mean(np.abs(recent_signal))
-
             if signal_mean_abs > 1e-6:
                 norm_var = np.var(recent_signal) / (signal_mean_abs ** 2)
                 norm_range = np.ptp(recent_signal) / signal_mean_abs
-                self.apnea_active = (norm_var < 0.05 and norm_range < 0.3)
+                is_flat = (norm_var < 0.05 and norm_range < 0.3)
+            else: is_flat = True
+                
+            if is_flat:
+                self._apnea_timer += frames
+                if self._apnea_timer >= int(10.0 * self.fps):
+                    self.apnea_active = True
+                    apnea_status = "apnea_event"
+                elif self._apnea_timer >= int(4.0 * self.fps):
+                    apnea_status = "pause_candidate"
             else:
-                self.apnea_active = True
+                self._apnea_timer = 0
+                self.apnea_active = False
 
-            if self.apnea_active:
-                self.apnea_duration += (frames / float(self.fps))
-            else:
-                self.apnea_duration = 0.0
+            if self.apnea_active: self.apnea_duration += (frames / float(self.fps))
+            else: self.apnea_duration = 0.0
         else:
             self.apnea_active = False
             self.apnea_duration = 0.0
+            self._apnea_timer = 0
 
-        if self.apnea_active:
-            self.apnea_trace[-frames:] = True
+        if self.apnea_active: self.apnea_trace[-frames:] = True
+        self.apnea_tracker.update(apnea_segments, self.fps, len(live_signal), self._global_frame_idx)
 
-        # Update ApneaTracker with detected segments
-        self.apnea_tracker.update(
-            apnea_segments, self.fps,
-            len(live_signal), self._global_frame_idx
-        )
-
-        # --- Peak Detection (Inhales = Troughs, Exhales = Peaks) ---
-        inhales = []
-        exhales = []
-
-        # Gate: skip during bin instability, low amplitude, or apnea
+        # 9. Peak Detection & RR
+        inhales, exhales = [], []
         sig_range = np.ptp(live_signal)
-        is_low_amplitude = sig_range < 0.1  # mm — very small displacement
+        is_low_amplitude = sig_range < 0.1
 
-        if (self.confidence > 20.0
-                and not self.apnea_active
-                and not is_bin_unstable
-                and not is_low_amplitude):
+        if (self.state == "TRACK" and self.confidence > 20.0 and not self.apnea_active and not is_low_amplitude):
             min_dist = max(1, int(self.fps * 0.5))
             prominence = max(0.01, sig_range * 0.25)
-
             exhales_arr, _ = signal.find_peaks(live_signal, distance=min_dist, prominence=prominence)
             inhales_arr, _ = signal.find_peaks(-live_signal, distance=min_dist, prominence=prominence)
-            exhales = exhales_arr.tolist()
-            inhales = inhales_arr.tolist()
+            exhales, inhales = exhales_arr.tolist(), inhales_arr.tolist()
 
-            # --- Respiration Rate (RR) & Cycle Duration ---
             if len(inhales) >= 2:
                 intervals = np.diff(inhales) / self.fps
                 valid_intervals = intervals[(intervals > 0.5) & (intervals < 6.0)]
                 if len(valid_intervals) > 0:
                     self.cycle_duration = np.median(valid_intervals)
                     self.current_rr = 60.0 / self.cycle_duration
-                else:
-                    self.current_rr = 0.0
-            else:
-                self.current_rr = 0.0
+                else: self.current_rr = 0.0
+            else: self.current_rr = 0.0
+            self.cycle_tracker.update(exhales, self._global_frame_idx, len(live_signal))
+        else: self.current_rr = 0.0
 
-            # Update BreathCycleTracker with exhale peaks
-            self.cycle_tracker.update(
-                exhales, self._global_frame_idx, len(live_signal)
-            )
-        else:
-            self.current_rr = 0.0
-
-        # --- Depth Classification ---
-        if self.confidence > 20.0 and not self.apnea_active:
+        # 10. Depth Classification
+        if self.state == "TRACK" and self.confidence > 20.0 and not self.apnea_active:
             baseline_mean = np.mean(self.history_buffer)
             baseline_amplitude = np.mean(np.abs(self.history_buffer - baseline_mean))
-
             recent_mean = np.mean(live_signal)
             recent_amplitude = np.mean(np.abs(live_signal - recent_mean))
-
             if baseline_amplitude > 1e-4:
-                amplitude_ratio = recent_amplitude / baseline_amplitude
-                if amplitude_ratio > 1.3:
-                    self.depth_status = "deep"
-                elif amplitude_ratio < 0.7:
-                    self.depth_status = "shallow"
-                else:
-                    self.depth_status = "normal"
-            else:
-                self.depth_status = "unknown"
-        elif self.apnea_active:
-            self.depth_status = "apnea"
-        else:
-            self.depth_status = "unknown"
+                ratio = recent_amplitude / baseline_amplitude
+                if ratio > 1.3: self.depth_status = "deep"
+                elif ratio < 0.7: self.depth_status = "shallow"
+                else: self.depth_status = "normal"
+            else: self.depth_status = "unknown"
+        elif self.apnea_active: self.depth_status = "apnea"
+        else: self.depth_status = "unknown"
 
-        # Roll RR history for plot synced to the live_signal time axis
         self.rr_history_buffer = np.roll(self.rr_history_buffer, -frames)
         self.rr_history_buffer[-frames:] = self.current_rr
-
-        # BRV
         brv_n = getattr(config.respiration, 'brv_history_size', 20)
         brv_value = self.cycle_tracker.get_brv(n=brv_n)
 
@@ -457,34 +505,39 @@ class RespiratoryPipeline:
             "apnea_duration": self.apnea_duration,
             "apnea_trace": self.apnea_trace,
             "apnea_segments": apnea_segments,
+            "apnea_status": apnea_status,
             "apnea_count": self.apnea_tracker.count,
             "apnea_durations": list(self.apnea_tracker.durations_sec),
             "depth": self.depth_status,
             "confidence": self.confidence,
-            "motion_status": act_pipe_out_dict['motion_str'],
+            "motion_status": self.state,
             "locked_bin": self.locked_bin,
             "cycle_count": self.cycle_tracker.count,
             "brv_value": brv_value,
             "last_cycle_duration": self.cycle_tracker.last_duration,
         }
 
-    def _reset_state(self):
+    def _reset_state_soft(self):
         self.apnea_active = False
         self.apnea_duration = 0.0
-        self.apnea_trace = np.zeros(self.window_frames, dtype=bool)
-        self.rr_history_buffer = np.zeros(self.window_frames)
         self.depth_status = "unknown"
         self.confidence = 0.0
-        self.locked_bin = None
-        self.history_buffer = np.zeros(self.baseline_frames)
         self.current_rr = 0.0
         self.cycle_duration = 0.0
+        self._apnea_timer = 0
+        
+    def _reset_state(self):
+        self._reset_state_soft()
+        self.apnea_trace = np.zeros(self.window_frames, dtype=bool)
+        self.rr_history_buffer = np.zeros(self.window_frames)
+        self.locked_bin = None
+        self.history_buffer = np.zeros(self.baseline_frames)
         self.frames_since_present = 0
         self.apnea_tracker.reset()
         self.cycle_tracker.reset()
         self._global_frame_idx = 0
-        self._prev_locked_bin = None
-        self._bin_stable_frames = 0
+        self.state = "OFF"
+        self.stable_resp_frames = 0
 
     def _get_empty_dict(self):
         return {
@@ -555,6 +608,11 @@ class RespiratoryPipelineV2:
         """
         Process exactly one or more new frames from the Activity Pipeline's sliding spectral_history window.
         """
+        # Guard against incomplete Pipeline output
+        required_keys = ['final_bin', 'motion_str', 'spectral_history']
+        if not all(k in act_pipe_out_dict for k in required_keys):
+            return None
+
         current_bin = act_pipe_out_dict['final_bin']
         motion_str = act_pipe_out_dict['motion_str']
         self._global_frame_idx += frames
@@ -575,7 +633,9 @@ class RespiratoryPipelineV2:
         target_data = self.unwrap_fn(raw_phase)
         
         # 7. Phase difference (remove DC) strictly yielding streaming Phase Velocity
-        difference_data = target_data[1:] - target_data[:-1]
+        # Padding with 0 to maintain length N (was N-1)
+        difference_data = np.zeros_like(target_data)
+        difference_data[1:] = target_data[1:] - target_data[:-1]
         
         # 8. Lowpass filter the raw phase velocity
         b, a = signal.butter(4, 0.5, 'lowpass', fs=self.fps) 
@@ -584,19 +644,33 @@ class RespiratoryPipelineV2:
         else:
             respiration_signal = difference_data
             
+        # ── APNEA DETECTION PATH (unchanged) ──────────────────────────────
+        # Uses phase velocity (difference + lowpass) -> derivative -> abs
         # 9. Metrics (Apnea, Depth, RR)
         first_derivative = np.gradient(respiration_signal)
         abs_derivative = np.abs(first_derivative)
         
-        # Standardize derivative based on early buffer filling
-        if not hasattr(self, 'deriv_base_max') or self._global_frame_idx < self.window_frames:
-            self.deriv_base_min = np.min(abs_derivative)
-            self.deriv_base_max = np.max(abs_derivative)
-            
-        sig_range = max(self.deriv_base_max - self.deriv_base_min, 0.05)
-        raw_scale_derivative = (abs_derivative - self.deriv_base_min) / sig_range
-        
-        # 10. Inject strictly newest values into Frozen Local UI Buffers (guarantees past plot never wiggles)
+        # Fixed physical scale (dynamic scaling disabled)
+        self.deriv_base_max = 0.2
+        sig_range = self.deriv_base_max
+        raw_scale_derivative = abs_derivative / sig_range
+
+        # ── DISPLAY PATH: Bandpass on raw phase (0.05–0.5 Hz) ────────────────
+        # Applies a highpass filter (0.05 Hz) to the unwrapped phase (before
+        # differentiation) to remove slow drift from posture/position changes.
+        # Combined with the 0.5 Hz lowpass this is a bandpass that preserves
+        # the sinusoidal chest displacement waveform. During apnea the signal
+        # flattens because there are no oscillations in the 0.05-0.5 Hz band.
+        # if len(target_data) > 15:
+        #     b_hp, a_hp = signal.butter(2, 0.05, 'highpass', fs=self.fps)
+        #     b_lp, a_lp = signal.butter(4, 0.5,  'lowpass',  fs=self.fps)
+        #     hp_phase = signal.lfilter(b_hp, a_hp, target_data)
+        #     bandpass_signal = signal.lfilter(b_lp, a_lp, hp_phase)
+        # else:
+        #     bandpass_signal = target_data
+
+        # 10. Inject newest values into Frozen Local UI Buffers
+        # Display buffer uses bandpass displacement (not velocity)
         self.plot_resp_buffer = np.roll(self.plot_resp_buffer, -frames)
         self.plot_resp_buffer[-frames:] = respiration_signal[-frames:]
         
@@ -674,17 +748,23 @@ class RespiratoryPipelineV2:
         self.rr_history_buffer = np.roll(self.rr_history_buffer, -frames)
         self.rr_history_buffer[-frames:] = current_rr
         
-        # Depth Estimation (Peak to Trough Amplitude)
-        depth_str = "normal"
-        if len(peaks) > 0 and len(troughs) > 0:
-            last_peak = peaks[-1]
-            last_trough = troughs[-1]
-            if last_peak < len(display_signal) and last_trough < len(display_signal):
-                depth_val = abs(display_signal[last_peak] - display_signal[last_trough])
-                if depth_val < 5.0:
-                    depth_str = "shallow"
-                elif depth_val > 15.0:
-                    depth_str = "deep"
+        # Depth Estimation: only from recent peaks (last 10s), suppressed during apnea
+        depth_str = "--"
+        if not self.apnea_active and len(peaks) > 0 and len(troughs) > 0:
+            recent_cutoff = max(0, len(display_signal) - int(10 * self.fps))
+            recent_peaks   = [p for p in peaks   if p >= recent_cutoff]
+            recent_troughs = [t for t in troughs if t >= recent_cutoff]
+            if recent_peaks and recent_troughs:
+                last_peak   = recent_peaks[-1]
+                last_trough = recent_troughs[-1]
+                if last_peak < len(display_signal) and last_trough < len(display_signal):
+                    depth_val = abs(display_signal[last_peak] - display_signal[last_trough])
+                    if depth_val < 5.0:
+                        depth_str = "shallow"
+                    elif depth_val > 15.0:
+                        depth_str = "deep"
+                    else:
+                        depth_str = "normal"
                     
         # BRV Estimation (Variance of breath cycle durations in seconds)
         brv_val = 0.0
@@ -706,7 +786,7 @@ class RespiratoryPipelineV2:
             'depth': depth_str,
             'inhales': troughs,
             'exhales': peaks,
-            'rr_history': np.copy(self.rr_history_buffer[-len(respiration_signal):]),
+            'rr_history': np.copy(self.rr_history_buffer),
             'apnea_active': self.apnea_active,
             'apnea_segments': apnea_segments,
             'apnea_duration': self.live_apnea_frames / self.fps,

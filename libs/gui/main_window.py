@@ -149,6 +149,10 @@ class MainWindow(QMainWindow):
         occ_c = QColor(config.gui_theme.occupant)
         self.fill_resp = pg.FillBetweenItem(self.curve_resp, self.curve_resp_zero, brush=pg.mkBrush(occ_c.red(), occ_c.green(), occ_c.blue(), 35))
         self.resp_plot.addItem(self.fill_resp)
+        
+        # Vernier Belt Overlay
+        self.curve_belt = self.resp_plot.plot(pen=pg.mkPen(color='#FACC15', width=1.5), name="Belt Ref") # Yellow
+        
         self.scatter_inhale = pg.ScatterPlotItem(size=10, brush=pg.mkBrush('green'), symbol='t')
         self.scatter_exhale = pg.ScatterPlotItem(size=10, brush=pg.mkBrush('red'), symbol='t1')
         self.resp_plot.addItem(self.scatter_inhale)
@@ -804,8 +808,40 @@ class MainWindow(QMainWindow):
         if resp_dict and (resp_dict.get('confidence', 0) > 0 or resp_dict.get('is_calibrating', False)):
             sig = resp_dict.get('live_signal', [])
             x_sig = self.x_axis[-len(sig):]
-            self.curve_resp.setData(x_sig, sig)
-            self.curve_resp_zero.setData(x_sig, np.zeros(len(sig)))
+            
+            # --- Normalize Radar for Display Overlay ---
+            # Remove DC and scale to [-1, 1] for visual check
+            radar_centered = sig - np.median(sig) if len(sig) > 0 else sig
+            rmx = np.max(np.abs(radar_centered)) if len(sig) > 0 else 0
+            display_radar = (radar_centered / rmx) if rmx > 0.01 else radar_centered
+            
+            self.curve_resp.setData(x_sig, display_radar)
+            self.curve_resp_zero.setData(x_sig, np.zeros(len(display_radar)))
+            
+            # Scale Y axis for normalized overlay
+            self.resp_plot.setYRange(-1.5, 1.5)
+
+            # Update Belt Overlay
+            belt_history = resp_dict.get('belt_history')
+            if belt_history is not None:
+                belt_fps = config.vernier.rate_hz
+                belt_samples_total = resp_dict.get('belt_samples_total', 0)
+                valid_len = min(belt_samples_total, len(belt_history))
+                
+                if valid_len > belt_fps:
+                    # Normalize Belt
+                    belt_view = belt_history[-valid_len:]
+                    belt_centered = belt_view - np.median(belt_view)
+                    bmx = np.max(np.abs(belt_centered))
+                    belt_norm = (belt_centered / bmx) if bmx > 0.01 else belt_centered
+                    
+                    # Align time axis (relative to current 0s)
+                    belt_x = np.linspace(-(valid_len/belt_fps), 0, len(belt_norm))
+                    self.curve_belt.setData(belt_x, belt_norm)
+                else:
+                    self.curve_belt.setData([], [])
+            else:
+                self.curve_belt.setData([], [])
 
             rr_hist = resp_dict.get('rr_history', [])
             x_rr = self.x_axis[-len(rr_hist):]
@@ -816,12 +852,14 @@ class MainWindow(QMainWindow):
             inhs = resp_dict.get('inhales', [])
             exhs = resp_dict.get('exhales', [])
             if len(inhs) > 0 and len(sig) > 0:
-                self.scatter_inhale.setData(x_sig[inhs], sig[inhs])
+                # Use normalized signal for scatter mapping
+                self.scatter_inhale.setData(x_sig[inhs], display_radar[inhs])
             else:
                 self.scatter_inhale.setData([], [])
 
             if len(exhs) > 0 and len(sig) > 0:
-                self.scatter_exhale.setData(x_sig[exhs], sig[exhs])
+                # Use normalized signal for scatter mapping
+                self.scatter_exhale.setData(x_sig[exhs], display_radar[exhs])
             else:
                 self.scatter_exhale.setData([], [])
 
@@ -929,6 +967,13 @@ class MainWindow(QMainWindow):
                     f"📏 Depth: {resp_dict.get('depth', 'unknown')}",
                     f"📐 Amplitude: {np.ptp(sig):.2f} mm" if len(sig) > 0 else "📐 Amplitude: --",
                 ]
+                
+                if resp_dict.get('belt_connected'):
+                    last_force = resp_dict['belt_history'][-1] if len(resp_dict['belt_history']) > 0 else 0
+                    parts.append(f"🎗️ Belt: {last_force:.1f} N")
+                elif config.vernier.enabled:
+                    parts.append(f"🎗️ Belt: Wait...")
+
                 self.resp_info_bar.setText("   |   ".join(parts))
 
         else:

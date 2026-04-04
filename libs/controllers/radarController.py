@@ -8,6 +8,7 @@ import time
 import struct
 from config import config
 import platform
+import traceback
 
 # TODO: Make it configurable (Yaml file)
 if platform.system() == 'Darwin':
@@ -131,6 +132,7 @@ class RadarController(multiprocessing.Process):
                         if len(chirp_temp) == 163:
                             self.analyticalBuffer(chirp_temp)          
             except:
+                is_error = True
                 traceback.print_exc()
                 print('traceback.format_exc():\n%s' % traceback.format_exc())
 

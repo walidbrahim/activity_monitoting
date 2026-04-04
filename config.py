@@ -140,6 +140,21 @@ class CameraConfig(BaseModel):
     enabled: bool = True
     device_index: int = 0
 
+class VernierConfig(BaseModel):
+    enabled: bool = False
+    rate_hz: int = 20
+    use_ble: bool = False
+    sensors: List[int] = [1]
+    model: str = "GDX-RB 0K203641"
+    mac: str = "BC:33:AC:AE:BE:35"
+
+class WitMotionConfig(BaseModel):
+    enabled: bool = False
+    mac: str = ""
+    rate_hz: int = 50
+    location: str = "unknown"
+    channel: str = "ACC"
+
 class AppConfig(BaseModel):
     layout: Dict[str, Dict[str, Any]]
     camera: CameraConfig = Field(default_factory=CameraConfig)
@@ -152,6 +167,9 @@ class AppConfig(BaseModel):
     app: AppFlagsConfig
     gui_theme: GuiThemeConfig
     tuning: TuningConfig = Field(default_factory=TuningConfig)
+    vernier: VernierConfig = Field(default_factory=VernierConfig)
+    witmotion1: WitMotionConfig = Field(default_factory=WitMotionConfig)
+    witmotion2: WitMotionConfig = Field(default_factory=WitMotionConfig)
 
     @classmethod
     def load(cls, file_path: str = "profiles/app_config.yaml") -> "AppConfig":

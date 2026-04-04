@@ -13,3 +13,5 @@ pyqtgraph
 xarm
 hidapi
 opencv-python
+godirect
+bleak

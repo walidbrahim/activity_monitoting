@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import QApplication
 from config import config
 from libs.controllers.radarController import RadarController
 from libs.controllers.robotController import RobotController
+from libs.controllers.vernier_belt_controller import VernierBeltControllerThread
 from libs.threads.processor_thread import ProcessorThread
 from libs.gui.main_window import MainWindow
 from libs.utils import send_watch_alert
@@ -21,12 +22,31 @@ def main():
     state_q = multiprocessing.Queue()
     pt_fft_q = multiprocessing.Queue()
     
+    # 2.5 Setup Vernier Belt Controller (Optional)
+    vernier_belt_realtime_q = multiprocessing.Queue()
+    vernier_belt_connection_q = multiprocessing.Queue()
+    belt_thread = None
+    if config.vernier.enabled:
+        belt_thread = VernierBeltControllerThread(
+            vernier_belt_connection_q=vernier_belt_connection_q,
+            vernier_belt_realtime_q=vernier_belt_realtime_q,
+            sensors=config.vernier.sensors,
+            period=int(1000/config.vernier.rate_hz),
+            use_ble=config.vernier.use_ble
+        )
+        belt_thread.daemon = True
+        belt_thread.start()
+
     # 3. Start Radar Process (runs truly independent of GIL)
     radar_process = RadarController(state_q=state_q, pt_fft_q=pt_fft_q)
     radar_process.start()
 
     # 4. Start Background Processing Thread
-    processor_thread = ProcessorThread(pt_fft_q=pt_fft_q)
+    processor_thread = ProcessorThread(
+        pt_fft_q=pt_fft_q, 
+        vernier_belt_realtime_q=vernier_belt_realtime_q,
+        vernier_belt_connection_q=vernier_belt_connection_q
+    )
     
     # 4.5 Start Robot Controller
     robot_ctrl = RobotController()
@@ -104,6 +124,8 @@ def main():
         robot_ctrl.update_pose(config.layout["Room"]["arm_move"]) # move to home position
 
     processor_thread.stop()
+    if belt_thread:
+        belt_thread.stop()
     if robot_ctrl.enabled:
         robot_ctrl.stop()
         robot_ctrl.join(timeout=2.0)
