@@ -1,0 +1,51 @@
+stateDiagram-v2
+    [*] --> RAW_POSTURE_ESTIMATION
+
+    RAW_POSTURE_ESTIMATION --> RAW_STANDING: posture_z >= standing_threshold
+    RAW_POSTURE_ESTIMATION --> RAW_SITTING: posture_z >= sitting_threshold\nAND posture_z < standing_threshold
+    RAW_POSTURE_ESTIMATION --> RAW_LYING: posture_z < sitting_threshold
+
+    RAW_STANDING --> BUFFER_GATE
+    RAW_SITTING --> BUFFER_GATE
+    RAW_LYING --> BUFFER_GATE
+
+    BUFFER_GATE --> STABLE_UNKNOWN: init (before first 8-frame consensus)
+    BUFFER_GATE --> STABLE_STANDING: len(posture_buf)==POSTURE_CONFIRM\nAND all entries == STANDING
+    BUFFER_GATE --> STABLE_SITTING: len(posture_buf)==POSTURE_CONFIRM\nAND all entries == SITTING
+    BUFFER_GATE --> STABLE_LYING: len(posture_buf)==POSTURE_CONFIRM\nAND all entries == LYING_DOWN
+
+    STABLE_UNKNOWN --> RAW_POSTURE_ESTIMATION: next frame
+    STABLE_STANDING --> RAW_POSTURE_ESTIMATION: next frame
+    STABLE_SITTING --> RAW_POSTURE_ESTIMATION: next frame
+    STABLE_LYING --> RAW_POSTURE_ESTIMATION: next frame
+
+    note right of RAW_POSTURE_ESTIMATION
+      Inputs:
+      - tracked (x,y,z)
+      - valid candidates
+      Derived proxy:
+      posture_z = max(z of candidates within posture_z_neighborhood_m) + posture_z_bias
+      fallback: tracked z when no nearby candidates
+    end note
+
+    note right of RAW_STANDING
+      Confidence:
+      conf = min(100, 60 + (posture_z - standing_threshold) * 80)
+    end note
+
+    note right of RAW_SITTING
+      Confidence:
+      conf = 70
+    end note
+
+    note right of RAW_LYING
+      Confidence:
+      conf = min(100, 75 + (sitting_threshold - posture_z) * 80)
+    end note
+
+    note right of BUFFER_GATE
+      Gating / hysteresis:
+      POSTURE_CONFIRM = 8 frames (default)
+      stable_posture updates only when 8 consecutive raw labels agree.
+      Output posture each frame is stable_posture, not raw_posture.
+    end note

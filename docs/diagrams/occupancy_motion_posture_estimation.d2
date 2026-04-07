@@ -1,0 +1,59 @@
+direction: down
+
+T: "Input A\nIn: tracker state\nOut: xyz, vz, conf, bin"
+C: "Input B\nIn: detector output\nOut: candidate points + zones"
+V: "Input C\nIn: vital features\nOut: micro-state"
+ML: "Input D\nIn: tracker motion energy\nOut: motion_level"
+
+ZD: "(1) Stabilize zone assignment\nIn: per-frame zones\nOut: debounced zone/sub-zone"
+ZS: "Zone output\nOut: stable zone + sub-zone"
+PZ: "(2) Estimate body height proxy\nIn: nearby candidates (+track xyz)\nOut: posture_z"
+PC: "(3) Classify posture\nIn: posture_z + thresholds\nOut: raw posture + posture_conf"
+PH: "(4) Stabilize posture over time\nIn: raw posture stream\nOut: stable posture"
+POUT: "Posture output\nOut: posture + confidence"
+
+MC: "(5) Compute motion score + label\nIn: motion_level + zone + micro-state\nOut: score + label + walking flag"
+MOUT: "Motion output\nOut: motion bundle"
+
+OCC: "(6) Occupancy state machine\nIn: target conf + zone + motion\nOut: occupancy + confidence"
+OOUT: "Occupancy output\nOut: occupancy + confidence"
+
+AP: "(7) Long-stillness apnea candidate check\nIn: occupancy + motion\nOut: apnea candidate flag/count"
+FOUT: "(8) Final ActivityState\nIn: zone + posture + motion + occupancy + apnea candidate\nOut: ActivityState"
+
+C -> ZD -> ZS
+C -> PZ
+T -> PZ
+PZ -> PC -> PH -> POUT
+ML -> MC
+V -> MC
+ZS -> MC
+POUT -> MC
+MC -> MOUT
+T -> OCC
+ZS -> OCC
+MOUT -> OCC
+OCC -> OOUT
+OOUT -> AP
+MOUT -> AP
+AP -> FOUT
+POUT -> FOUT
+MOUT -> FOUT
+OOUT -> FOUT
+ZS -> FOUT
+
+N1: "Zone gate:\nupdate after zone_debounce_frames consecutive matches (default 5)."
+N2: "Posture thresholds (defaults):\nstanding>=0.95m; sitting in [0.45,0.95); else lying."
+N3: "Posture hysteresis:\ncommit after posture_confirm_frames consecutive agreement (default 8)."
+N4: "Motion formulas:\nscore=clamp(motion_level/restless_max,0,1)\nRESTING if score < rest_max/restless_max."
+N5: "Walking gate:\nMACRO_PHASE and motion_level>restless_max and zone in Transit/Floor."
+N6: "Occupancy timing:\nEntering->Occupied after entry_hold_seconds x fps (~75 @25fps)."
+N7: "Apnea-candidate timing:\nstillness counter >= apnea threshold (often ~150 frames)."
+
+ZD -> N1
+PC -> N2
+PH -> N3
+MC -> N4
+MC -> N5
+OCC -> N6
+AP -> N7

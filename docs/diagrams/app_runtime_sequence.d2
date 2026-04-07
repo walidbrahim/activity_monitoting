@@ -1,0 +1,23 @@
+direction: right
+
+RP: "RadarController (process)"
+Q: "pt_fft_q"
+BC: "BedMonitorController"
+RE: "RadarEngine"
+GUI: "MainWindow / Respiration GUI"
+POL: "App Policy (robot/alerts)"
+
+RP -> Q: "(1) Push new radar frame\nOut: raw complex frame"
+BC -> Q: "(2) Pull available frames\nIn: queue frames\nOut: frame batch"
+BC -> RE: "(3) Run frame batch\nIn: frames + config + pose"
+RE -> BC: "(4) Return typed EngineOutput\nOut: activity/respiration/vitals models"
+BC -> GUI: "(5) Publish GUI payload\nOut: app-facing dicts"
+BC -> POL: "(6) Publish policy events\nOut: zone/posture/motion_score/fall"
+POL -> BC: "(7) Optional pose request\nOut: pose update command"
+BC -> RE: "(8) Apply new radar pose\nOut: next-frame transform"
+
+N1: "Runtime pose formula (concept):\nworld_xyz = T_pose x sensor_xyz."
+N2: "Boundary rule:\nGUI receives translated dicts;\ntyped engine models stay inside controller."
+
+RE -> N1
+GUI -> N2

@@ -1,0 +1,24 @@
+direction: down
+
+B: "Load base profile\nIn: profiles/base.yaml\nOut: base dict"
+O: "Apply room override (optional)\nIn: profiles/<room>.yaml\nOut: override dict"
+L: "Deep-merge profile sections\nIn: base + override\nOut: merged dict"
+AC: "Validate AppConfig\nIn: merged dict\nOut: typed AppConfig"
+CF: "Map to EngineConfig\nIn: AppConfig\nOut: EngineConfig sections"
+EC: "Build Engine dataclass bundle\nIn: mapped sections\nOut: cohesive EngineConfig"
+ENG: "Construct RadarEngine\nIn: EngineConfig\nOut: engine instance"
+T: "High-priority runtime overrides\nOut: mapping patch"
+
+B -> L
+O -> L
+L -> AC
+AC -> CF
+CF -> EC
+EC -> ENG
+T -> CF
+
+N1: "Merge rule:\nmerged[key] = override[key] for scalar\nrecursive merge for object/object."
+N2: "ConfigFactory is the single translation boundary\nfrom profile schema to engine dataclasses."
+
+L -> N1
+CF -> N2

@@ -1,0 +1,41 @@
+flowchart LR
+    subgraph L1["Layer 1 - Data Acquisition"]
+        H["(1) Profile hardware settings<br/>In: YAML profile<br/>Out: acquisition params"]
+        P["(2) RadarController reads radar frames<br/>In: hardware params<br/>Out: raw complex frames"]
+        Q["(3) Frame queue (pt_fft_q)<br/>In: raw frames<br/>Out: buffered frame stream"]
+        H --> P --> Q
+    end
+
+    subgraph L2["Layer 2 - Engine and Translation"]
+        F["(4) Build typed EngineConfig<br/>In: AppConfig<br/>Out: EngineConfig dataclasses"]
+        C["(5) BedMonitorController orchestrates runtime<br/>In: queue + config<br/>Out: frame batches + app dicts"]
+        E["(6) RadarEngine estimates state<br/>In: frames + pose + config<br/>Out: typed estimates"]
+        O["(7) EngineOutput<br/>In: engine branches<br/>Out: activity + vitals + respiration models"]
+        F --> C
+        C --> E --> O
+    end
+
+    subgraph L3["Layer 3 - App Policy and UI"]
+        A1["(8) Main monitoring app<br/>In: app-facing dicts<br/>Out: monitoring workflow"]
+        A2["(9) Respiration-focused app<br/>In: app-facing dicts<br/>Out: resp UI workflow"]
+        G["(10) GUI rendering and display policy<br/>In: app state<br/>Out: plots/badges/labels"]
+        R["(11) Robot and alert actions<br/>In: policy events<br/>Out: commands/alerts"]
+        O --> A1 --> G
+        O --> A2 --> G
+        A1 --> R
+    end
+
+    CFG["profiles/base.yaml (+ optional room overlay)<br/>In: user tuning<br/>Out: merged app profile"] --> F
+    Q --> C
+    N1["Note: this boundary keeps estimation logic independent of GUI code."]:::note
+    N2["Note: app policy can evolve without changing radar_engine internals."]:::note
+    E -.-> N1
+    G -.-> N2
+
+    classDef source fill:#E0F2FE,stroke:#0284C7,color:#0C4A6E;
+    classDef engine fill:#ECFDF5,stroke:#10B981,color:#064E3B;
+    classDef app fill:#FFF7ED,stroke:#F97316,color:#7C2D12;
+    classDef note fill:#FFFBEB,stroke:#D97706,color:#7C2D12,stroke-dasharray: 4 3;
+    class H,P,Q,CFG source;
+    class F,C,E,O engine;
+    class A1,A2,G,R app;

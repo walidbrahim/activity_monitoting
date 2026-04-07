@@ -1,0 +1,56 @@
+flowchart TD
+    T["Input A<br/>In: tracker state<br/>Out: xyz, vz, conf, bin"]
+    C["Input B<br/>In: detector output<br/>Out: candidate points + zones"]
+    V["Input C<br/>In: vital features<br/>Out: micro-state"]
+    ML["Input D<br/>In: tracker motion energy<br/>Out: motion_level"]
+
+    C --> ZD["(1) Stabilize zone assignment<br/>In: per-frame zone labels<br/>Out: debounced zone/sub-zone"]
+    ZD --> ZS["Zone output<br/>In: debounced vote<br/>Out: stable zone + sub-zone"]
+
+    C --> PZ["(2) Estimate body height proxy<br/>In: nearby candidates (+track xyz)<br/>Out: posture_z"]
+    T --> PZ
+    PZ --> PC["(3) Classify posture<br/>In: posture_z + thresholds<br/>Out: raw posture + posture_conf"]
+    PC --> PH["(4) Stabilize posture over time<br/>In: raw posture stream<br/>Out: stable posture label"]
+    PH --> POUT["Posture output<br/>In: stable label + conf<br/>Out: posture + confidence"]
+
+    ML --> MC["(5) Compute motion score + label<br/>In: motion_level + zone + micro-state<br/>Out: motion_score + motion label + walking flag"]
+    V --> MC
+    ZS --> MC
+    POUT --> MC
+    MC --> MOUT["Motion output<br/>In: score/label/flag<br/>Out: motion bundle"]
+
+    T --> OCC["(6) Update occupancy state machine<br/>In: target conf + zone + motion<br/>Out: occupancy state + occupancy_conf"]
+    ZS --> OCC
+    MOUT --> OCC
+    OCC --> OOUT["Occupancy output<br/>In: occupancy machine<br/>Out: occupancy + confidence"]
+
+    OOUT --> AP["(7) Check long-stillness apnea candidate<br/>In: occupancy + motion<br/>Out: apnea_candidate flag/count"]
+    MOUT --> AP
+    AP --> FOUT["(8) Final unified activity state<br/>In: zone + posture + motion + occupancy + apnea_candidate<br/>Out: ActivityState"]
+
+    POUT --> FOUT
+    MOUT --> FOUT
+    OOUT --> FOUT
+    ZS --> FOUT
+    N1["Zone gate: update only after zone_debounce_frames consecutive matches (default 5)."]:::note
+    N2["Posture thresholds: standing if posture_z >= 0.95 m, sitting if 0.45-0.95 m, else lying (defaults)."]:::note
+    N3["Posture hysteresis: commit label only after posture_confirm_frames consecutive agreement (default 8)."]:::note
+    N4["Motion formulas: motion_score = clamp(motion_level / restless_max, 0, 1); RESTING if score < rest_max/restless_max."]:::note
+    N5["Walking gate: micro_state=MACRO_PHASE and motion_level > restless_max and zone in Transit/Floor."]:::note
+    N6["Occupancy timing: Entering -> Occupied after entry_hold_seconds x fps (about 75 frames at 25 fps)."]:::note
+    N7["Apnea-candidate timing: stillness counter >= apnea_frames threshold (often ~150 frames, config-dependent)."]:::note
+    ZD -.-> N1
+    PC -.-> N2
+    PH -.-> N3
+    MC -.-> N4
+    MC -.-> N5
+    OCC -.-> N6
+    AP -.-> N7
+
+    classDef inputs fill:#E0F2FE,stroke:#0284C7,color:#0C4A6E;
+    classDef stages fill:#F8FAFC,stroke:#64748B,color:#0F172A;
+    classDef outputs fill:#ECFDF5,stroke:#10B981,color:#064E3B;
+    classDef note fill:#FFFBEB,stroke:#D97706,color:#7C2D12,stroke-dasharray: 4 3;
+    class T,C,V,ML inputs;
+    class ZD,PZ,PC,PH,MC,OCC,AP stages;
+    class ZS,POUT,MOUT,OOUT,FOUT outputs;

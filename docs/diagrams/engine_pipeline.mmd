@@ -1,0 +1,31 @@
+flowchart LR
+    F["(1) Complex FFT frame<br/>In: ADC/FFT cube<br/>Out: frame[t,rx,chirp/bin]"]
+    P["(2) Preprocess frame<br/>In: complex frame<br/>Out: clutter-reduced profile + spectral history"]
+    D["(3) Detect candidate bins<br/>In: preprocessed profile<br/>Out: candidate points (range/xyz/zone/conf)"]
+    T["(4) Track best target over time<br/>In: candidates + previous track<br/>Out: tracked target (stable xyz/bin/vz/conf)"]
+    V["(5) Extract vital micro-features<br/>In: spectral history + tracked bin<br/>Out: micro-state + periodicity features"]
+    A["(6) Estimate activity<br/>In: tracked target + micro-state + motion_level<br/>Out: occupancy + posture + motion_score"]
+    RX["(7) Extract respiration signal<br/>In: tracked bin + spectral history<br/>Out: live_signal + derivative + quality"]
+    RA["(8) Analyze respiration metrics<br/>In: respiration signal<br/>Out: RR + apnea + cycle metrics"]
+    O["(9) Emit unified EngineOutput<br/>In: track + activity + respiration branches<br/>Out: typed EngineOutput"]
+
+    F --> P --> D --> T
+    T --> V --> O
+    T --> A --> O
+    T --> RX --> RA --> O
+    N1["Preprocess gate: downstream is blocked until warmup_frames calibration completes."]:::note
+    N2["Detection formula (concept): candidate if magnitude(bin) > threshold and zone is valid."]:::note
+    N3["Tracking gate: only confirmed/stable continuity feeds activity and respiration."]:::note
+    N4["Respiration gate: requires spectral history and confirmed bin lock."]:::note
+    N5["Motion formula: motion_score = clamp(motion_level / restless_max, 0, 1)."]:::note
+    P -.-> N1
+    D -.-> N2
+    T -.-> N3
+    RX -.-> N4
+    A -.-> N5
+
+    classDef stage fill:#F8FAFC,stroke:#475569,color:#0F172A;
+    classDef output fill:#FEF3C7,stroke:#F59E0B,color:#78350F;
+    classDef note fill:#FFFBEB,stroke:#D97706,color:#7C2D12,stroke-dasharray: 4 3;
+    class F,P,D,T,V,A,RX,RA stage;
+    class O output;

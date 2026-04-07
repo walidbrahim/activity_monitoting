@@ -1,0 +1,48 @@
+stateDiagram-v2
+    [*] --> EMPTY: Init / reset()
+
+    EMPTY --> ENTERING: target.valid == true\nentry_frames = 1
+    ENTERING --> ENTERING: target.valid == true AND entry_frames < FRAMES_TO_OCCUPY\nentry_frames += 1\noccupancy_conf = (entry_frames / FRAMES_TO_OCCUPY) * 50
+    ENTERING --> OCCUPANCY_CORE: target.valid == true AND entry_frames >= FRAMES_TO_OCCUPY\nis_occupied = true\nentry_frames = 0
+
+    OCCUPANCY_CORE --> MONITORING: motion in {RESTING, STATIC, FIDGETING}\nocc_conf = min(100, 60 + target.confidence * 10)
+    OCCUPANCY_CORE --> OCCUPIED: motion not in {RESTING, STATIC, FIDGETING}\nocc_conf = min(100, 60 + target.confidence * 10)
+
+    MONITORING --> MONITORING: target.valid == true AND motion in {RESTING, STATIC, FIDGETING}
+    MONITORING --> OCCUPIED: target.valid == true AND motion not in {RESTING, STATIC, FIDGETING}
+
+    OCCUPIED --> OCCUPIED: target.valid == true AND motion not in {RESTING, STATIC, FIDGETING}
+    OCCUPIED --> APNEA_CANDIDATE: target.valid == true AND apnea_frames >= APNEA_FRAMES\n(apnea_frames increments only when motion in {RESTING, STATIC})
+    OCCUPIED --> MONITORING: target.valid == true AND motion in {RESTING, STATIC, FIDGETING}\nAND apnea_frames < APNEA_FRAMES
+
+    APNEA_CANDIDATE --> MONITORING: target.valid == true AND motion in {RESTING, STATIC, FIDGETING}\n(next frame occupancy core selects MONITORING)
+    APNEA_CANDIDATE --> OCCUPIED: target.valid == true AND motion not in {RESTING, STATIC, FIDGETING}
+
+    ENTERING --> EMPTY: target.valid == false\n_update_occupancy_empty()\nentry_frames = 0
+    MONITORING --> EMPTY: target.valid == false\n_update_occupancy_empty()\nis_occupied = false\napnea_frames = 0
+    OCCUPIED --> EMPTY: target.valid == false\n_update_occupancy_empty()\nis_occupied = false\napnea_frames = 0
+    APNEA_CANDIDATE --> EMPTY: target.valid == false\n_update_occupancy_empty()\nis_occupied = false\napnea_frames = 0
+
+    note right of ENTERING
+      In:
+      - target.valid
+      - entry_frames counter
+      Out:
+      - OccupancyState.ENTERING
+      - partial confidence (0..50)
+    end note
+
+    note right of OCCUPANCY_CORE
+      Gate parameters:
+      - FRAMES_TO_OCCUPY = int(entry_hold_seconds * 25)
+      - APNEA_FRAMES = 150 (default)
+      Core confidence:
+      occ_conf = min(100, 60 + target.confidence * 10)
+    end note
+
+    note right of APNEA_CANDIDATE
+      Promotion rule:
+      if apnea_frames >= APNEA_FRAMES
+      AND occupancy_core output is OCCUPIED
+      then output APNEA_CANDIDATE
+    end note

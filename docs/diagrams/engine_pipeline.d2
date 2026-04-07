@@ -1,0 +1,28 @@
+direction: right
+
+F: "Complex FFT frame\nIn: ADC/FFT cube\nOut: frame[t,rx,chirp/bin]"
+P: "Preprocess frame\nIn: complex frame\nOut: clutter-reduced profile + spectral history"
+D: "Detect candidate bins\nIn: preprocessed profile\nOut: candidate points (range/xyz/zone/conf)"
+T: "Track best target\nIn: candidates + previous track\nOut: stable target (xyz/bin/vz/conf)"
+V: "Extract vital micro-features\nIn: spectral history + tracked bin\nOut: micro-state + periodicity features"
+A: "Estimate activity\nIn: tracked target + micro-state + motion_level\nOut: occupancy + posture + motion_score"
+RX: "Extract respiration signal\nIn: tracked bin + spectral history\nOut: live signal + derivative + quality"
+RA: "Analyze respiration metrics\nIn: respiration signal\nOut: RR + apnea + cycle metrics"
+O: "Emit EngineOutput\nOut: typed activity + respiration + tracking bundle"
+
+F -> P -> D -> T
+T -> V -> O
+T -> A -> O
+T -> RX -> RA -> O
+
+N1: "Preprocess gate:\nblock downstream until warmup_frames completes."
+N2: "Detection gate (concept):\ncandidate if magnitude(bin) > threshold and zone is valid."
+N3: "Tracking gate:\nonly stable confirmed target feeds activity/respiration."
+N4: "Respiration gate:\nrequires spectral history and confirmed bin lock."
+N5: "Motion formula:\nmotion_score = clamp(motion_level / restless_max, 0, 1)."
+
+P -> N1
+D -> N2
+T -> N3
+RX -> N4
+A -> N5
