@@ -1,0 +1,27 @@
+flowchart TD
+    A["Inputs<br/>smoothed XY/Z, motion_level, micro_state, zone, XY history"]
+    B["motion_level update (Step 3)<br/>shift_distance = ||median_xyz - track_xyz||<br/>motion_level = 0.2*shift + 0.8*prev"]
+    W{"Walking gate?<br/>zone=Floor/Transit & history full & disp>=walk_displacement_m"}
+    LW["motion_str = Walking"]
+    M{"motion_level > restless_max ?"}
+    LM["motion_str = Major Movement"]
+    P{"micro_state == MACRO_PHASE<br/>and active zone in Bed/Chair ?"}
+    LP["motion_str = Postural Shift"]
+    S{"motion_level > rest_max ?"}
+    LS["motion_str = Restless/Shifting"]
+    F{"micro_state == MICRO_PHASE ?"}
+    LF["motion_str = Restless/Fidgeting"]
+    LR["motion_str = Resting/Breathing"]
+    O["Outputs<br/>motion_str, motion_level"]
+
+    A --> B --> W
+    W -- "yes" --> LW --> O
+    W -- "no" --> M
+    M -- "yes" --> LM --> O
+    M -- "no" --> P
+    P -- "yes" --> LP --> O
+    P -- "no" --> S
+    S -- "yes" --> LS --> O
+    S -- "no" --> F
+    F -- "yes" --> LF --> O
+    F -- "no" --> LR --> O

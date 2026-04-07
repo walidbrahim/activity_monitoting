@@ -1,0 +1,15 @@
+flowchart TD
+    A["Inputs<br/>track_x, track_y, Z_b<br/>valid_candidates, zone, motion_str"]
+    P["Posture-Z proxy<br/>highest candidate z in neighborhood<br/>fallback Z_b<br/>apply bias and z-clip"]
+    W{"motion_str == Walking ?"}
+    S["Behavior prior<br/>stable_posture = Standing"]
+    T["Transit bias (Floor/Transit)<br/>stand_lo -= transit_standing_bias_m<br/>sit_hi/sit_lo += transit_standing_bias_m"]
+    H["Hysteresis bands<br/>stand_hi/stand_lo<br/>sit_hi/sit_lo"]
+    U["State update<br/>Standing/Sitting/Lying transitions<br/>with hysteresis thresholds"]
+    B["Bed sub-zone debounce<br/>majority vote on suffix"]
+    O["Outputs<br/>posture, posture_z, final_zone"]
+
+    A --> P --> W
+    W -- "yes" --> S --> T
+    W -- "no" --> T
+    T --> H --> U --> B --> O

@@ -1,0 +1,20 @@
+shape: sequence_diagram
+
+Radar as RadarController
+Thread as ProcessorThread
+Act as ActivityPipeline
+Gate as MonitorGate
+Resp as RespiratoryPipelineV2
+GUI as MainWindow
+
+Radar -> Thread: enqueue fft_frame
+Thread -> Act: process_frame(frame)
+Act -> Thread: occ_dict
+Thread -> Gate: evaluate zone/status
+
+Gate -> Resp: eligible => process(occ_dict, frames)
+Resp -> Thread: resp_dict
+Gate -> Thread: not eligible => _reset_state()
+
+Thread -> GUI: data_ready(occ_dict, resp_dict)
+GUI -> GUI: update cards/plots/layout

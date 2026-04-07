@@ -1,0 +1,77 @@
+direction: down
+
+Input: {
+  shape: rectangle
+  label: "Inputs per frame\nis_valid_point, is_jump\ndynamic_mag(bin)\nmicro_state\nzone type (monitor/non-monitor)\nraw_mag_profile"
+}
+
+Gate1: {
+  shape: diamond
+  label: "Active-target gate passes?"
+}
+
+Gate1Rule: {
+  shape: rectangle
+  label: "Gate method\n1) jump must be false\n2) dynamic_mag >= detection_threshold\n3) micro_state not in DEAD_SPACE, STATIC_GHOST\n4) WEAK_VITAL has extra suppression near threshold"
+}
+
+Entry: {
+  shape: rectangle
+  label: "Entry debounce\nentry_frames += 1\nneed entry_frames >= frames_to_occupy\nframes_to_occupy = frame_rate * entry_hold_seconds"
+}
+
+SetOccupied: {
+  shape: rectangle
+  label: "Confirm occupancy\nis_occupied = true\nlast_target_bin = dynamic_peak_bin\napnea_frames = 0\nstatus = Occupied (Breathing/Moving)"
+}
+
+ReflEma: {
+  shape: rectangle
+  label: "Occupied reflection EMA\ncurrent_peak = max(raw_mag around target bin)\nif rising: alpha=0.005\nif falling: alpha=0.03"
+}
+
+Persist: {
+  shape: rectangle
+  label: "If no active target but is_occupied\npersist using last_target_bin\nand zone-specific logic"
+}
+
+MonitorGate: {
+  shape: diamond
+  label: "Current zone type == monitor?"
+}
+
+MonitorCont: {
+  shape: rectangle
+  label: "Monitor continuity gate\ncurrent_reflection from +/-3 bins\nthreshold = occupied_reflection * continuity_ratio\nif above threshold: monitoring/apnea path\nif below: dip counter++\nreset track only after dip_tolerance"
+}
+
+NonMonitor: {
+  shape: rectangle
+  label: "Non-monitor zones\nreflection continuity disabled\nstatus = Room Presence\ntrack lifetime owned by persistence"
+}
+
+Conf: {
+  shape: rectangle
+  label: "Occupancy confidence\nocc_conf = 0.6*temporal_conf + 0.4*signal_conf - miss penalty"
+}
+
+Out: {
+  shape: rectangle
+  label: "Outputs\nstatus\nocc_confidence\nis_occupied state"
+}
+
+Input -> Gate1
+Gate1Rule -> Gate1
+Gate1 -> Entry: "yes and not yet occupied"
+Entry -> SetOccupied: "debounce reached"
+SetOccupied -> ReflEma
+ReflEma -> Conf
+
+Gate1 -> Persist: "no, but already occupied"
+Persist -> MonitorGate
+MonitorGate -> MonitorCont: "yes"
+MonitorGate -> NonMonitor: "no"
+MonitorCont -> Conf
+NonMonitor -> Conf
+
+Conf -> Out

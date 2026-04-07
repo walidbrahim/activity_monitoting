@@ -1,0 +1,51 @@
+direction: right
+
+RadarController: {
+  shape: rectangle
+  label: "RadarController\n(raw FFT frames)"
+}
+
+ProcessorThread: {
+  shape: rectangle
+  label: "ProcessorThread\n(queue consumer + orchestrator)"
+}
+
+ActivityPipeline: {
+  shape: rectangle
+  label: "ActivityPipeline\nclutter + candidates + tracking\nzone/posture/motion/fall"
+}
+
+RespPipelineV2: {
+  shape: rectangle
+  label: "RespiratoryPipelineV2\nphase extraction + apnea + RR + BRV"
+}
+
+MainWindow: {
+  shape: rectangle
+  label: "MainWindow / GUI\nupdate_dashboard(occ_dict, resp_dict)"
+}
+
+Vernier: {
+  shape: rectangle
+  label: "Vernier Belt Thread\n(optional)"
+}
+
+RobotCtrl: {
+  shape: rectangle
+  label: "RobotController\n(optional zone-driven pose)"
+}
+
+Gate: {
+  shape: diamond
+  label: "Zone type == monitor\nand status != No Occupant ?"
+}
+
+RadarController -> ProcessorThread: "pt_fft_q"
+Vernier -> ProcessorThread: "belt queues"
+ProcessorThread -> ActivityPipeline: "process_frame(fft_frame)"
+ActivityPipeline -> Gate: "occ_dict"
+Gate -> RespPipelineV2: "yes"
+RespPipelineV2 -> ProcessorThread: "resp_dict"
+Gate -> ProcessorThread: "no => reset resp state"
+ProcessorThread -> MainWindow: "data_ready(occ_dict, resp_dict)"
+ProcessorThread -> RobotCtrl: "zone/pose events (main.py handler)"

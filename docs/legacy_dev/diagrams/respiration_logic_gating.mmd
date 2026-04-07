@@ -1,0 +1,21 @@
+flowchart TD
+    A["Inputs from occ_dict<br/>zone, status, final_bin, motion_str, spectral_history, frames"]
+    G{"ProcessorThread gate:<br/>zone type == monitor<br/>and status != No Occupant ?"}
+    R["No gate pass<br/>RespiratoryPipelineV2._reset_state()"]
+    L["Target lock<br/>if lock none or motion_str == MACRO_PHASE<br/>locked_bin = final_bin"]
+    F["Fusion<br/>sum spectral_history[bin-1:bin+1]"]
+    P["Signal processing<br/>unwrap_phase_Ambiguity (deg)<br/>phase diff<br/>lowpass Butterworth(4, 0.5Hz)"]
+    D["Frozen display buffers<br/>plot_resp_buffer<br/>plot_deriv_buffer"]
+    C{"Calibration complete?<br/>global_frame_idx >= 40s*fps"}
+    T["Set dynamic apnea threshold<br/>max(0.05, P95(derivative)*0.25)"]
+    AP["Apnea gate (5s window)<br/>P95(derivative[-5s:]) <= threshold"]
+    RR["RR logic<br/>peaks/troughs + BreathCycleTracker<br/>anchor decay when peaks stop"]
+    B["Depth + BRV<br/>depth from peak-trough amplitude<br/>BRV = std(cycle_durations)"]
+    O["resp_dict outputs<br/>live_signal, derivative_signal<br/>rr_current/history, apnea metrics<br/>depth, brv"]
+
+    A --> G
+    G -- "no" --> R
+    G -- "yes" --> L --> F --> P --> D --> C
+    C -- "yes (first time)" --> T --> AP
+    C -- "no / already calibrated" --> AP
+    AP --> RR --> B --> O

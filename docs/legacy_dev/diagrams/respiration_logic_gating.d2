@@ -1,0 +1,80 @@
+direction: down
+
+Input: {
+  shape: rectangle
+  label: "Inputs\nocc_dict from ActivityPipeline\n(zone, status, final_bin,\nmotion_str, spectral_history)\nframes_in_batch"
+}
+
+AppGate: {
+  shape: diamond
+  label: "ProcessorThread gate\nbase_zone type == monitor\nand status != No Occupant ?"
+}
+
+ResetResp: {
+  shape: rectangle
+  label: "No gate pass\nRespiratoryPipelineV2._reset_state()"
+}
+
+Lock: {
+  shape: rectangle
+  label: "Target lock\nif lock is None or motion_str == MACRO_PHASE\nlocked_bin = final_bin"
+}
+
+Fusion: {
+  shape: rectangle
+  label: "Signal extraction\nfused_complex = sum(spectral_history[bin-1:bin+1])"
+}
+
+Phase: {
+  shape: rectangle
+  label: "Processing method\nunwrap_phase_Ambiguity (deg)\ndifference_data = phase diff\nlowpass Butterworth(order=4, fc=0.5Hz)"
+}
+
+DisplayBuf: {
+  shape: rectangle
+  label: "Frozen display buffers\nplot_resp_buffer\nplot_deriv_buffer"
+}
+
+CalibGate: {
+  shape: diamond
+  label: "Calibration complete?\n_global_frame_idx >= 40s * fps"
+}
+
+CalibSet: {
+  shape: rectangle
+  label: "Set dynamic apnea threshold\napnea_threshold = max(0.05, P95(derivative)*0.25)"
+}
+
+Apnea: {
+  shape: rectangle
+  label: "Apnea method\nwindow = 5s\nafter calibration:\npercentile95(derivative[-5s:]) <= apnea_threshold\n=> apnea_active"
+}
+
+RR: {
+  shape: rectangle
+  label: "RR method\npeak/trough detection on display_signal\nBreathCycleTracker update\nanchor-decay when peaks stop"
+}
+
+Depth: {
+  shape: rectangle
+  label: "Depth + BRV\ndepth from recent peak-trough amplitude\nBRV = std(cycle_durations)"
+}
+
+Out: {
+  shape: rectangle
+  label: "resp_dict\nlive_signal\nderivative_signal\nrr_current, rr_history\napnea_active, apnea_segments, apnea_count\ndepth, brv_value"
+}
+
+Input -> AppGate
+AppGate -> ResetResp: "no"
+AppGate -> Lock: "yes"
+Lock -> Fusion
+Fusion -> Phase
+Phase -> DisplayBuf
+DisplayBuf -> CalibGate
+CalibGate -> CalibSet: "yes (first time)"
+CalibGate -> Apnea: "no / already calibrated"
+CalibSet -> Apnea
+Apnea -> RR
+RR -> Depth
+Depth -> Out

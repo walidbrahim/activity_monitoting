@@ -1,0 +1,27 @@
+flowchart TD
+    A["Inputs per frame<br/>is_valid_point, is_jump<br/>dynamic_mag(bin), micro_state<br/>zone type, raw_mag_profile"]
+    R["Active-target gate method<br/>1) not jump<br/>2) dynamic_mag >= detection_threshold<br/>3) micro_state not ghost-like<br/>4) WEAK_VITAL suppression near threshold"]
+    G{"Active-target gate passes?"}
+    E["Entry debounce<br/>entry_frames += 1<br/>need entry_frames >= frames_to_occupy"]
+    O["Confirm occupancy<br/>is_occupied = true<br/>last_target_bin = dynamic_peak_bin"]
+    M["Occupied reflection EMA<br/>rising alpha=0.005<br/>falling alpha=0.03"]
+    P["If no active target but occupied<br/>persist via zone-specific logic"]
+    Z{"Current zone type == monitor?"}
+    C["Monitor continuity gate<br/>threshold = occupied_reflection * continuity_ratio<br/>dip counter with dip_tolerance"]
+    N["Non-monitor handling<br/>skip reflection continuity<br/>status = Room Presence"]
+    K["Occupancy confidence<br/>occ_conf = 0.6*temporal + 0.4*signal - miss penalty"]
+    Y["Outputs<br/>status, occ_confidence, occupancy state"]
+
+    A --> G
+    R --> G
+    G -- "yes and not occupied" --> E
+    E --> O
+    O --> M
+    M --> K
+    G -- "no but occupied" --> P
+    P --> Z
+    Z -- "yes" --> C
+    Z -- "no" --> N
+    C --> K
+    N --> K
+    K --> Y

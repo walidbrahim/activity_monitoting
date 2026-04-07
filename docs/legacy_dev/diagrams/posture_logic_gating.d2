@@ -1,0 +1,56 @@
+direction: down
+
+Input: {
+  shape: rectangle
+  label: "Inputs\ntrack_x, track_y, Z_b\nvalid_candidates list\nzone label\nmotion_str (walking prior)"
+}
+
+Proxy: {
+  shape: rectangle
+  label: "Posture-Z proxy method\n1) candidates within posture_z_neighborhood_m around track XY\n2) posture_z = max(candidate z)\n3) fallback to Z_b if none\n4) bias and clip to [z_clip_min, z_clip_max]"
+}
+
+WalkPrior: {
+  shape: diamond
+  label: "motion_str == Walking ?"
+}
+
+SetStand: {
+  shape: rectangle
+  label: "Behavior prior\nstable_posture = Standing"
+}
+
+TransitBias: {
+  shape: rectangle
+  label: "If zone is Floor/Transit\nwiden standing stickiness\nstand_lo -= transit_standing_bias_m\nsit_hi/sit_lo += transit_standing_bias_m"
+}
+
+Hyst: {
+  shape: rectangle
+  label: "Hysteresis thresholds\nhm = posture_hysteresis_m\nstand_hi = standing_threshold + hm\nstand_lo = standing_threshold - hm\nsit_hi = sitting_threshold + hm\nsit_lo = sitting_threshold - hm"
+}
+
+StateUpdate: {
+  shape: rectangle
+  label: "State-machine update\nfrom stable_posture:\nStanding -> Sitting/Lying only below stand_lo\nSitting -> Standing above stand_hi, Lying below sit_lo\nLying -> Sitting above sit_hi, Standing above stand_hi"
+}
+
+Subzone: {
+  shape: rectangle
+  label: "Bed sub-zone debounce\nmajority vote on suffix\n(Center/Edges)\ncoarse zone debounce handled separately"
+}
+
+Out: {
+  shape: rectangle
+  label: "Outputs\nposture\nposture_z\nfinal_zone (with debounced bed subzone)"
+}
+
+Input -> Proxy
+Proxy -> WalkPrior
+WalkPrior -> SetStand: "yes"
+WalkPrior -> TransitBias: "no"
+SetStand -> TransitBias
+TransitBias -> Hyst
+Hyst -> StateUpdate
+StateUpdate -> Subzone
+Subzone -> Out

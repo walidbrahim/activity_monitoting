@@ -1,0 +1,60 @@
+direction: down
+
+Input: {
+  shape: rectangle
+  label: "Inputs\nsmoothed track XY/Z\nmotion_level (EMA)\nmicro_state\nzone label\nXY history window"
+}
+
+MotionScore: {
+  shape: rectangle
+  label: "motion_level update (Step 3)\nshift_distance = ||median_xyz - track_xyz||\nmotion_level = 0.2*shift_distance + 0.8*prev"
+}
+
+WalkCheck: {
+  shape: diamond
+  label: "Walking gate\nzone == Floor/Transit\nand XY window full\nand net displacement >= walk_displacement_m"
+}
+
+LabelWalk: {
+  shape: rectangle
+  label: "motion_str = Walking"
+}
+
+MajorCheck: { shape: diamond, label: "motion_level > restless_max ?" }
+PosturalCheck: { shape: diamond, label: "micro_state == MACRO_PHASE\nand active zone in Bed/Chair ?" }
+ShiftCheck: { shape: diamond, label: "motion_level > rest_max ?" }
+FidgetCheck: { shape: diamond, label: "micro_state == MICRO_PHASE ?" }
+
+LabelMajor: { shape: rectangle, label: "motion_str = Major Movement" }
+LabelPostural: { shape: rectangle, label: "motion_str = Postural Shift" }
+LabelShift: { shape: rectangle, label: "motion_str = Restless/Shifting" }
+LabelFidget: { shape: rectangle, label: "motion_str = Restless/Fidgeting" }
+
+LabelRest: {
+  shape: rectangle
+  label: "else\nmotion_str = Resting/Breathing"
+}
+
+Out: {
+  shape: rectangle
+  label: "Outputs\nmotion_str\nmotion_level"
+}
+
+Input -> MotionScore
+MotionScore -> WalkCheck
+WalkCheck -> LabelWalk: "yes"
+WalkCheck -> MajorCheck: "no"
+MajorCheck -> LabelMajor: "yes"
+MajorCheck -> PosturalCheck: "no"
+PosturalCheck -> LabelPostural: "yes"
+PosturalCheck -> ShiftCheck: "no"
+ShiftCheck -> LabelShift: "yes"
+ShiftCheck -> FidgetCheck: "no"
+FidgetCheck -> LabelFidget: "yes"
+FidgetCheck -> LabelRest: "no"
+LabelWalk -> Out
+LabelMajor -> Out
+LabelPostural -> Out
+LabelShift -> Out
+LabelFidget -> Out
+LabelRest -> Out

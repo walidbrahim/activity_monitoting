@@ -1,0 +1,50 @@
+direction: down
+
+Input: {
+  shape: rectangle
+  label: "Input FFT frame\n(range_bins x antennas)"
+}
+
+S1: {
+  shape: rectangle
+  label: "Step 1\nAntenna sign correction\nClutter suppression (EMA + spatial mask)\nWarmup gate\nSpectral-history ring write"
+}
+
+S2: {
+  shape: rectangle
+  label: "Step 2\nfind_peaks + CFAR/fixed threshold\nAngle/XYZ localization\nZone validation\nVital/aliveness scoring"
+}
+
+S3: {
+  shape: rectangle
+  label: "Step 3\nCandidate ranking + tethering\nConfidence/miss handling\nEMA + buffer smoothing\nStable-bin voting"
+}
+
+S4: {
+  shape: rectangle
+  label: "Step 4\nZone/subzone debounce\nPosture inference\nMotion string + score\nOccupancy state + duration"
+}
+
+S5: {
+  shape: rectangle
+  label: "Step 5\nFall logic\nContinuity hysteresis\nFinal output dict assembly"
+}
+
+Output: {
+  shape: rectangle
+  label: "occ_dict\n(X,Y,Z,final_bin,zone,status,posture,motion_str,\nconfidence,micro_state,spectral_history,raw_cube,...)"
+}
+
+WarmupCheck: {
+  shape: diamond
+  label: "frame_count <= warmup_frames ?"
+}
+
+Input -> S1
+S1 -> WarmupCheck
+WarmupCheck -> Output: "yes: calibrating dict"
+WarmupCheck -> S2: "no"
+S2 -> S3
+S3 -> S4
+S4 -> S5
+S5 -> Output

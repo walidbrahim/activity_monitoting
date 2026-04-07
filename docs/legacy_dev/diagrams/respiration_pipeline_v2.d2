@@ -1,0 +1,67 @@
+direction: down
+
+In: {
+  shape: rectangle
+  label: "Input from occ_dict\n(final_bin, motion_str, spectral_history, frames)"
+}
+
+Lock: {
+  shape: rectangle
+  label: "Target lock\nlock on final_bin\nre-lock on MACRO_PHASE"
+}
+
+Fuse: {
+  shape: rectangle
+  label: "Multi-bin fusion\nsum bins [locked-1 .. locked+1]"
+}
+
+Phase: {
+  shape: rectangle
+  label: "Unwrap phase\nunwrap_phase_Ambiguity (deg)\nphase difference"
+}
+
+Filter: {
+  shape: rectangle
+  label: "Low-pass filter\nButterworth order=4, cutoff=0.5 Hz"
+}
+
+Buf: {
+  shape: rectangle
+  label: "Frozen display buffers\nplot_resp_buffer\nplot_deriv_buffer"
+}
+
+Calib: {
+  shape: rectangle
+  label: "Dynamic apnea threshold\nat 40 s:\nthreshold = max(0.05, P95(deriv)*0.25)"
+}
+
+Apnea: {
+  shape: rectangle
+  label: "Apnea detection\n5 s window\nsegment merge + ApneaTracker"
+}
+
+RR: {
+  shape: rectangle
+  label: "RR / cycle logic\npeak-trough detect\nBreathCycleTracker\nanchor-based RR decay"
+}
+
+Depth: {
+  shape: rectangle
+  label: "Depth + BRV\npeak-trough amplitude\nBRV = std(cycle_durations)"
+}
+
+Out: {
+  shape: rectangle
+  label: "resp_dict\n(live_signal, derivative_signal,\nrr_current, cycle_count,\napnea_active, apnea_count,\ndepth, brv_value, ...)"
+}
+
+In -> Lock
+Lock -> Fuse
+Fuse -> Phase
+Phase -> Filter
+Filter -> Buf
+Buf -> Calib
+Calib -> Apnea
+Apnea -> RR
+RR -> Depth
+Depth -> Out
