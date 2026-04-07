@@ -49,8 +49,10 @@ class BedMonitorController(QThread):
         pt_fft_q,
         vernier_belt_realtime_q=None,
         vernier_belt_connection_q=None,
+        imu_queues: list = None,
         parent=None,
         cfg: EngineConfig | None = None,
+        app_cfg: any = None, # AppConfig from pydantic
         belt_window_sec: float = 30.0,
         belt_rate_hz:    float = 10.0,
         recording_cfg: dict | None = None,
@@ -60,7 +62,10 @@ class BedMonitorController(QThread):
         self.pt_fft_q                  = pt_fft_q
         self.vernier_belt_realtime_q   = vernier_belt_realtime_q
         self.vernier_belt_connection_q = vernier_belt_connection_q
+        self.imu_queues                = imu_queues or []
+        self.app_cfg                   = app_cfg
         self.running                   = True
+        self.is_aligning               = False
         self._pipeline_lock            = threading.Lock()
         self._cfg                      = cfg
 
@@ -116,9 +121,22 @@ class BedMonitorController(QThread):
     # ── Qt thread entry point ─────────────────────────────────────────────────
 
     def run(self) -> None:
+        print("\n🚀 BedMonitorController: Processing thread started.")
+        
+        # ── 0. Initial IMU Auto-Alignment ─────────────────────────────────────
+        auto_align_req = False
+        if self.app_cfg and hasattr(self.app_cfg, "app"):
+            auto_align_req = getattr(self.app_cfg.app, "imu_auto_align_enabled", False)
+        
+        print(f"📊 Auto-Alignment Configuration: {auto_align_req}")
+
+        if auto_align_req:
+            self._perform_startup_alignment()
+
+        print("📡 Entering main radar processing loop...")
         while self.running:
             try:
-                # 0. Vernier belt data (non-blocking drain)
+                # 1. Vernier belt data (non-blocking drain)
                 self._drain_belt_queues()
 
                 # 1. Block on FFT queue (timeout allows clean shutdown)
@@ -178,6 +196,70 @@ class BedMonitorController(QThread):
         self._export_recording()
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _perform_startup_alignment(self) -> None:
+        """Collects 1 second of IMU data and updates the radar pose."""
+        self.is_aligning = True
+        idx = int(getattr(self.app_cfg.app, "radar_imu_index", 0))
+        if idx >= len(self.imu_queues):
+            print(f"Auto-alignment stalled: IMU index {idx} not provided")
+            self.is_aligning = False
+            return
+
+        q = self.imu_queues[idx]
+        yaw_offset = float(getattr(self.app_cfg.app, "imu_yaw_offset", 180.0))
+        pitch_mult = float(getattr(self.app_cfg.app, "radar_pitch_multiplier", -1.0))
+
+        print("Starting Radar Auto-Alignment... waiting for IMU samples.")
+        samples = []
+        timeout = time.time() + 30.0 # max 30s wait for connection
+
+        last_log = time.time()
+        while len(samples) < 25 and time.time() < timeout and self.running:
+            try:
+                data = q.get(timeout=0.1)
+                # Store: a_x, a_z, angl_x
+                samples.append((data[0], data[2], data[6]))
+                if len(samples) % 5 == 0:
+                    print(f"Alignment Progress: {len(samples)}/25 samples collected...")
+            except queue.Empty:
+                if time.time() - last_log > 2.0:
+                    print(f"Auto-Alignment still waiting for packets (current: {len(samples)})...")
+                    last_log = time.time()
+                continue
+
+        if len(samples) < 10:
+            print(f"Auto-alignment failed: insufficient IMU samples ({len(samples)})")
+            self.is_aligning = False
+            return
+
+        import math
+        avg_a_x = np.mean([s[0] for s in samples])
+        avg_a_z = np.mean([s[1] for s in samples])
+        avg_yaw = np.mean([s[2] for s in samples])
+
+        raw_pitch = math.degrees(math.atan2(avg_a_z, -avg_a_x))
+        pitch_offset = float(getattr(self.app_cfg.app, "imu_pitch_offset", 0.0))
+        new_pitch = (raw_pitch + pitch_offset) * pitch_mult
+        
+        new_yaw   = (avg_yaw + yaw_offset) % 360
+
+        print(f"✅ Auto-Alignment Complete: IMU(P:{raw_pitch:.1f}, Y:{avg_yaw:.1f}) -> Radar(P:{new_pitch:.1f}, Y:{new_yaw:.1f})")
+        self.is_aligning = False
+
+        # Update the engine pose (maintaining XYZ coordinates from config)
+        default_zone = getattr(self.app_cfg.app, "default_radar_pose", "Bed")
+        current_pose = self.app_cfg.layout.get(default_zone, {}).get("radar_pose", {})
+
+        new_pose = {
+            "x": float(current_pose.get("x", 0.0)),
+            "y": float(current_pose.get("y", 0.0)),
+            "z": float(current_pose.get("z", 0.0)),
+            "pitch_deg": float(new_pitch),
+            "yaw_deg": float(new_yaw),
+            "fov_deg": float(current_pose.get("fov_deg", 120.0))
+        }
+        self.update_radar_pose(new_pose)
 
     def _drain_belt_queues(self) -> None:
         """Non-blocking drain of Vernier belt queues."""

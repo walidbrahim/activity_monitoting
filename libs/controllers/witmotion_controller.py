@@ -55,7 +55,9 @@ class WitMotionControllerThread(Thread):
                 async with BleakClient(self.witmotion_mac_addr, timeout=15.0) as client:
                     self.connected = client.is_connected
                     if self.connected:
-                        print(f"WitMotion [{self.location}] Connected successfully.")
+                        print(f"WitMotion [{self.location}] Connected successfully. Waiting for service stability...")
+                        await asyncio.sleep(1.0)    # Brief delay for adapter stability & auto-discovery
+                        print(f"WitMotion [{self.location}] Starting data stream...")
                         await client.start_notify(self.UUID_READ, self.data_conv)
                         
                         # Keep-alive and command polling loop

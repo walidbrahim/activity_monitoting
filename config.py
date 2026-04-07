@@ -26,6 +26,11 @@ class AppFlagsConfig(BaseModel):
     send_alert: bool
     enable_robot_arm: bool = True
     default_radar_pose: str = "Room"
+    imu_auto_align_enabled: bool = False
+    radar_imu_index: int = 0
+    imu_yaw_offset: float = 180.0
+    imu_pitch_offset: float = 0.0
+    radar_pitch_multiplier: float = -1.0
 
 
 class GuiThemeConfig(BaseModel):

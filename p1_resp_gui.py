@@ -138,7 +138,9 @@ class RespirationMonitorApp(QMainWindow):
         self.processor = BedMonitorController(
             pt_fft_q=self.pt_fft_q,
             vernier_belt_realtime_q=self.vernier_belt_realtime_q,
+            imu_queues=self.imu_queues,
             cfg=self.eng_cfg,
+            app_cfg=self.app_cfg,
             belt_window_sec=self.window_sec,
             belt_rate_hz=getattr(self.app_cfg.vernier, 'rate_hz', 10.0),
             recording_cfg=self.app_cfg.recording.model_dump(),
@@ -496,26 +498,29 @@ class RespirationMonitorApp(QMainWindow):
         self._update_camera()
         
         # ── IMUs ──────────────────────────────────────────────────────────────
-        for i, q in enumerate(self.imu_queues):
-            samples = []
-            while not q.empty():
-                try: samples.append(q.get_nowait())
-                except queue.Empty: break
-            if samples:
-                z = [s[2] for s in samples]
-                med = np.median(z); p2p = max(z) - min(z)
-                if self.imu_offset_emas[i] is None:
-                    self.imu_offset_emas[i] = med
-                    self.imu_scale_emas[i]  = max(0.1, p2p/2)
-                else:
-                    α = 0.05
-                    self.imu_offset_emas[i] = (1-α)*self.imu_offset_emas[i] + α*med
-                    if p2p > 0.05:
-                        self.imu_scale_emas[i] = (1-α)*self.imu_scale_emas[i] + α*(p2p/2)
-                nz  = (np.array(z) - self.imu_offset_emas[i]) / max(0.01, self.imu_scale_emas[i])
-                buf = self.imu_buffers[i]
-                if len(nz) > len(buf): nz = nz[-len(buf):]
-                self.imu_buffers[i] = np.roll(buf, -len(nz)); self.imu_buffers[i][-len(nz):] = nz
+        # Skip polling if the processor is currently using these queues for auto-alignment
+        if not getattr(self.processor, 'is_aligning', False):
+            for i, q in enumerate(self.imu_queues):
+                samples = []
+                while not q.empty():
+                    try:
+                        samples.append(q.get_nowait())
+                    except queue.Empty: break
+                if samples:
+                        z = [s[2] for s in samples]
+                        med = np.median(z); p2p = max(z) - min(z)
+                        if self.imu_offset_emas[i] is None:
+                            self.imu_offset_emas[i] = med
+                            self.imu_scale_emas[i]  = max(0.1, p2p/2)
+                        else:
+                            α = 0.05
+                            self.imu_offset_emas[i] = (1-α)*self.imu_offset_emas[i] + α*med
+                            if p2p > 0.05:
+                                self.imu_scale_emas[i] = (1-α)*self.imu_scale_emas[i] + α*(p2p/2)
+                        nz  = (np.array(z) - self.imu_offset_emas[i]) / max(0.01, self.imu_scale_emas[i])
+                        buf = self.imu_buffers[i]
+                        if len(nz) > len(buf): nz = nz[-len(buf):]
+                        self.imu_buffers[i] = np.roll(buf, -len(nz)); self.imu_buffers[i][-len(nz):] = nz
 
         self._update_status_bar()
 
@@ -866,8 +871,12 @@ class RespirationMonitorApp(QMainWindow):
         if hasattr(self, "processor") and self.processor is not None:
             self.processor.stop()
         self.radar_process.terminate()
-        for t in self.imu_threads: t.stop()
-        if self.belt_thread: self.belt_thread.stop()
+        for t in self.imu_threads:
+            t.stop()
+            t.join(timeout=2.0)
+        if self.belt_thread:
+            self.belt_thread.stop()
+            self.belt_thread.join(timeout=2.0)
         if self._camera_cap is not None:
             self._camera_cap.release()
         super().closeEvent(event)

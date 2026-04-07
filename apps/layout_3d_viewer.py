@@ -90,9 +90,14 @@ class Layout3DViewer(QMainWindow):
         self._status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self._status)
 
-        self._fig = Figure(figsize=(11, 7))
+        self._fig = Figure(figsize=(12, 7))
         self._canvas = FigureCanvas(self._fig)
-        self._ax = self._fig.add_subplot(111, projection="3d")
+        
+        # Split layout: 3 quarters for 3D view, 1 quarter for Power bar chart
+        gs = self._fig.add_gridspec(1, 4)
+        self._ax = self._fig.add_subplot(gs[0, :3], projection="3d")
+        self._ax_bar = self._fig.add_subplot(gs[0, 3])
+        
         layout.addWidget(self._canvas)
 
         self._draw_static_scene()
@@ -152,11 +157,64 @@ class Layout3DViewer(QMainWindow):
             ry = float(radar_pose.get("y", 0.0))
             rz = float(radar_pose.get("z", 1.0))
             yaw = float(radar_pose.get("yaw_deg", 0.0))
+            pitch = float(radar_pose.get("pitch_deg", 0.0))
             yaw_rad = math.radians(yaw)
-            dx = 0.4 * (-math.sin(yaw_rad))
-            dy = 0.4 * (-math.cos(yaw_rad))
+            pitch_rad = math.radians(pitch)
+
+            import numpy as np
+
+            # Engine-identical rotation matrices
+            Ry = np.array([
+                [ math.cos(yaw_rad), -math.sin(yaw_rad), 0],
+                [ math.sin(yaw_rad),  math.cos(yaw_rad), 0],
+                [                 0,                  0, 1],
+            ])
+            Rp = np.array([
+                [1,                   0,                    0],
+                [0, math.cos(pitch_rad), -math.sin(pitch_rad)],
+                [0, math.sin(pitch_rad),  math.cos(pitch_rad)],
+            ])
+            R_mat = np.dot(Ry, Rp)
+
+            # Central direction line (length 0.4m)
+            fw = np.dot(R_mat, np.array([0.0, 0.4, 0.0]))
             ax.scatter([rx], [ry], [rz], c="#f39c12", s=60, marker="^", label="Radar")
-            ax.plot([rx, rx + dx], [ry, ry + dy], [rz, rz], c="#f39c12", linewidth=2.0)
+            ax.plot([rx, rx + fw[0]], [ry, ry + fw[1]], [rz, rz + fw[2]], c="#f39c12", linewidth=2.0)
+
+            # ── Draw 3D FoV Pyramid ──
+            az_fov = float(radar_pose.get("fov_deg", 120.0))
+            el_fov = float(radar_pose.get("elev_fov_deg", 45.0))
+            r_len = 2.5 # Project 2.5 meters out
+
+            h_az = math.radians(az_fov / 2.0)
+            h_el = math.radians(el_fov / 2.0)
+
+            angles = [
+                ( h_az,  h_el),
+                ( h_az, -h_el),
+                (-h_az, -h_el),
+                (-h_az,  h_el),
+            ]
+
+            base_pts = []
+            for (az, el) in angles:
+                # Local coordinate projection identical to localization.py
+                Pr = np.array([
+                    r_len * math.sin(az) * math.cos(el),
+                    r_len * math.cos(az) * math.cos(el),
+                    r_len * math.sin(el)
+                ])
+                Pb = np.dot(R_mat, Pr)
+                base_pts.append((rx + Pb[0], ry + Pb[1], rz + Pb[2]))
+
+            # Ray lines from Radar origin to base corners
+            for p in base_pts:
+                ax.plot([rx, p[0]], [ry, p[1]], [rz, p[2]], c="#f39c12", linewidth=1.0, alpha=0.3, linestyle="--")
+            
+            # Connect the base corners to form the outer rectangular face
+            for i in range(4):
+                pa, pb = base_pts[i], base_pts[(i+1)%4]
+                ax.plot([pa[0], pb[0]], [pa[1], pb[1]], [pa[2], pb[2]], c="#f39c12", linewidth=1.0, alpha=0.3, linestyle="-")
 
         ax.legend(loc="upper left")
         self._canvas.draw_idle()
@@ -269,6 +327,27 @@ class Layout3DViewer(QMainWindow):
                 linewidths=0.8,
                 label="Tracked point",
             )
+
+        # ── Draw dynamic CFAR vs Power bar chart ──
+        self._ax_bar.clear()
+        best_overall = max(candidates, key=lambda c: c.magnitude, default=None)
+        if best_overall:
+            labels = ["Peak SNR", "CFAR Thresh"]
+            mag = float(best_overall.magnitude)
+            thr = float(best_overall.cfar_threshold)
+            colors = ["#2ecc71" if best_overall.valid else "#e74c3c", "#95a5a6"]
+            bars = self._ax_bar.bar(labels, [mag, thr], color=colors, width=0.6)
+            self._ax_bar.set_title(f"Loudest Peak (Bin {best_overall.bin_index})\n{best_overall.range_m:.2f}m Away", fontsize=10)
+            self._ax_bar.set_ylim(0, max(max(mag, thr) * 1.25, 100))
+            
+            # Label bars with integers
+            for b in bars:
+                h = b.get_height()
+                self._ax_bar.text(b.get_x() + b.get_width() / 2, h + (max(mag, thr)*0.02), f"{int(h)}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+        else:
+            self._ax_bar.set_title("No Radar Echoes", fontsize=10)
+            self._ax_bar.set_ylim(0, 100)
+            self._ax_bar.set_xticks([])
 
         ax.legend(loc="upper left")
         self._canvas.draw_idle()

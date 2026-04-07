@@ -144,7 +144,7 @@ class TargetDetector(RadarModule):
                 candidates.append(TargetCandidate(
                     bin_index=cand_bin, range_m=0.0, x_m=0.0, y_m=0.0, z_m=0.0,
                     magnitude=mag, azimuth_rad=0.0, elevation_rad=0.0,
-                    zone="Unknown", valid=False, reject_reason="below_cfar",
+                    zone="Unknown", valid=False, cfar_threshold=cfar_thresh, reject_reason="below_cfar",
                 ))
                 continue
 
@@ -163,6 +163,7 @@ class TargetDetector(RadarModule):
                     x_m=x, y_m=y, z_m=z, magnitude=mag,
                     azimuth_rad=az, elevation_rad=el,
                     zone=zone_label, valid=False,
+                    cfar_threshold=cfar_thresh,
                     reject_reason="out_of_zone",
                 ))
                 continue
@@ -194,6 +195,7 @@ class TargetDetector(RadarModule):
                 elevation_rad = el,
                 zone          = zone_label,
                 valid         = True,
+                cfar_threshold= cfar_thresh,
                 reject_reason = None,
             ))
 

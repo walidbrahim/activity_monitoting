@@ -198,6 +198,10 @@ app:
   send_alert: false
   enable_robot_arm: false
   default_radar_pose: "Bed"
+  imu_auto_align_enabled: false
+  radar_imu_index: 0
+  imu_yaw_offset: 180.0
+  radar_pitch_multiplier: -1.0
 
 
 # ── Layer 4: GUI theme ─────────────────────────────────────────────────────────
@@ -225,7 +229,7 @@ gui_theme:
 # ── Peripherals ────────────────────────────────────────────────────────────────
 camera:
   enabled: true
-  device_index: 2
+  device_index: 1
 
 vernier:
   enabled: false

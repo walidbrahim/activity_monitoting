@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# profiles/bedroom.yaml — Example room-specific overlay
+#
+# Usage:
+#   cfg = load_profile("profiles/base.yaml", "profiles/bedroom.yaml")
+#
+# Only keys that differ from base.yaml need to be listed.
+# Deep merge: nested dicts are merged key-by-key, not replaced wholesale.
+# ─────────────────────────────────────────────────────────────────────────────
+
+hardware:
+  ti_serial:
+    mac_cli:  "/dev/cu.usbserial-00E242E70"
+    mac_data: "/dev/cu.usbserial-00E242E71"
+
+layout:
+  Room:
+    x: [0, 2]
+    y: [0, 2.5]
+    z: [0.0, 2.7]
+    radar_pose:
+      x: 2
+      y: 2.5
+      z: 1.1
+      yaw_deg: 125
+      pitch_deg: -20
+      fov_deg: 120
+
+  Bed:
+    x: [0.5, 1.5]
+    y: [0.5, 2]
+    z: [0.0, 2.0]
+    margin_x: [0.2, 0.2]
+    margin_y: [0.2, 0.2]
+    radar_pose:
+      x: 2
+      y: 2.5
+      z: 1.1
+      yaw_deg: 125
+      pitch_deg: -20
+      fov_deg: 120
+
+# ── Peripherals ─────────
+witmotion1:
+  enabled: true
+  mac: "FE:5E:58:D8:4C:64"
+  rate_hz: 200
+  location: "radar_mount"
+
+app:
+  default_radar_pose: "Bed"
+  send_alert: true
+  imu_yaw_offset: -10.0       # Adjusts the ~10deg raw reading to the expected 0deg (10 + 350 % 360 = 0)
+  imu_pitch_offset: 13.0      # Zeros out the 13deg physical resting tilt of the casing
+  radar_pitch_multiplier: 1.0 # Ensures tilting down remains a negative pitch (e.g. -29.8)
+
+# Developer overrides for this room (leave empty in production)
+tuning: {}

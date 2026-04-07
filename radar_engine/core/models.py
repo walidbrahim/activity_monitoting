@@ -107,6 +107,7 @@ class TargetCandidate:
     elevation_rad: float
     zone:          str
     valid:         bool
+    cfar_threshold:float = 0.0
     reject_reason: str | None = None
 
 
