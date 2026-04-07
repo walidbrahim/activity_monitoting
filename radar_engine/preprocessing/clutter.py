@@ -3,9 +3,6 @@ radar_engine.preprocessing.clutter
 =====================================
 ClutterMap — spatial-masked exponential moving-average clutter suppression.
 
-Extracted from ActivityPipeline._step1_hardware_and_detection() without any
-numerical changes to alpha values, masking logic, or protection radii.
-
 Ownership: RadarFramePreprocessor is the sole owner of a ClutterMap instance.
 """
 
