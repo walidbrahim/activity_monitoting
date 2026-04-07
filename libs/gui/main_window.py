@@ -100,7 +100,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(f"background-color: {config.gui_theme.fig_bg};")
 
         # History Buffers for plotting
-        hist_len = int(config.respiration.resp_window_sec * config.radar.frame_rate)
+        hist_len = int(config.respiration_cfg.window_sec * config.hardware.frame_rate)
         self.occ_hist       = [0]   * hist_len
         self.posture_hist   = [0]   * hist_len
         self.motion_hist    = [0]   * hist_len
@@ -109,7 +109,7 @@ class MainWindow(QMainWindow):
         self.thresh_hist    = [0]   * hist_len
         self.height_hist    = [0.0] * hist_len  # real-time Z (height) history
         self.posture_num_hist = [0] * hist_len  # posture encoded as integer for timeline plot
-        self.x_axis = np.linspace(-config.respiration.resp_window_sec, 0, hist_len)
+        self.x_axis = np.linspace(-config.respiration_cfg.window_sec, 0, hist_len)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -139,7 +139,7 @@ class MainWindow(QMainWindow):
         resp_layout.setContentsMargins(5, 5, 5, 5)
 
         self.resp_plot = self._create_plot("🫁 Live Breathing Signal", "Time (s)", "Displacement (mm)")
-        self._resp_window = config.respiration.resp_window_sec
+        self._resp_window = config.respiration_cfg.window_sec
         self.resp_plot.setXRange(-self._resp_window, 0, padding=0)
         self.resp_plot.setYRange(-25, 25)
         self.resp_plot.enableAutoRange(axis='x', enable=False)
@@ -307,7 +307,7 @@ class MainWindow(QMainWindow):
         
         self._mag_ann_bin = pg.TextItem("", anchor=(0, 1), color=config.gui_theme.text)
         self._mag_ann_bin.setFont(QFont("Arial", 12, QFont.Weight.Bold))
-        self._mag_ann_bin.setPos(-config.respiration.resp_window_sec, 200) # dynamic later but initial
+        self._mag_ann_bin.setPos(-config.respiration_cfg.window_sec, 200) # dynamic later but initial
         self.mag_plot.addItem(self._mag_ann_bin)
         
         power_layout.addWidget(self.mag_plot)
@@ -319,7 +319,7 @@ class MainWindow(QMainWindow):
         height_tab_layout.setContentsMargins(5, 5, 5, 5)
 
         self.height_plot = self._create_plot("📏 Estimated Height (Z)", "Time (s)", "Height (m)")
-        self.height_plot.setXRange(-config.respiration.resp_window_sec, 0, padding=0)
+        self.height_plot.setXRange(-config.respiration_cfg.window_sec, 0, padding=0)
         self.height_plot.setYRange(0, 2.2)
         self.height_plot.enableAutoRange(axis='x', enable=False)
         self.height_plot.enableAutoRange(axis='y', enable=False)
@@ -327,8 +327,8 @@ class MainWindow(QMainWindow):
             pen=pg.mkPen(color=config.gui_theme.occupant, width=2), name="Z")
 
         # Threshold lines
-        sit_thresh   = config.posture.sitting_threshold
-        stand_thresh = config.posture.standing_threshold
+        sit_thresh = config.activity.posture.sitting_threshold_m
+        stand_thresh = config.activity.posture.standing_threshold_m
         self._height_line_sit = pg.InfiniteLine(
             pos=sit_thresh, angle=0,
             pen=pg.mkPen(color="#F59E0B", width=1, style=Qt.PenStyle.DashLine),
@@ -364,7 +364,7 @@ class MainWindow(QMainWindow):
         posture_tl_layout.setContentsMargins(5, 5, 5, 5)
 
         self.posture_tl_plot = self._create_plot("🧐 Posture Timeline", "Time (s)", "")
-        self.posture_tl_plot.setXRange(-config.respiration.resp_window_sec, 0, padding=0)
+        self.posture_tl_plot.setXRange(-config.respiration_cfg.window_sec, 0, padding=0)
         self.posture_tl_plot.setYRange(-1.7, 4.7)
         self.posture_tl_plot.enableAutoRange(axis='x', enable=False)
         self.posture_tl_plot.enableAutoRange(axis='y', enable=False)
@@ -551,13 +551,9 @@ class MainWindow(QMainWindow):
         self.static_radar_text.setPos(radar_x, radar_y)
         self.radar_plot.addItem(self.static_radar_text)
         
-        path = QPainterPath()
-        path.moveTo(0, 0)
-        path.arcTo(-5, -5, 10, 10, yaw_deg - 90 - fov_deg/2, fov_deg)
-        path.closeSubpath()
+        path = self._build_fov_path(radar_x, radar_y, yaw_deg, fov_deg, radius=5.0)
         
         self.static_fov_item = pg.QtWidgets.QGraphicsPathItem(path)
-        self.static_fov_item.setPos(radar_x, radar_y)
         self.static_fov_item.setPen(pg.mkPen(color=config.gui_theme.fov, style=Qt.PenStyle.DashLine))
         self.static_fov_item.setBrush(pg.mkBrush(QColor(config.gui_theme.fov).getRgb()[:3] + (15,)))
         self.radar_plot.addItem(self.static_fov_item)
@@ -632,19 +628,37 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'static_radar_text'):
             self.static_radar_text.setPos(x, y)
         if hasattr(self, 'static_fov_item'):
-            from PyQt6.QtGui import QPainterPath
-            path = QPainterPath()
-            path.moveTo(0, 0)
-            path.arcTo(-5, -5, 10, 10, yaw_deg - 90 - fov_deg/2, fov_deg)
-            path.closeSubpath()
+            path = self._build_fov_path(x, y, yaw_deg, fov_deg, radius=5.0)
             self.static_fov_item.setPath(path)
-            self.static_fov_item.setPos(x, y)
 
-    @pyqtSlot(dict, dict)
-    def update_dashboard(self, occ_dict, resp_dict):
+    def _build_fov_path(self, x: float, y: float, yaw_deg: float, fov_deg: float, radius: float = 5.0):
+        """Build FoV wedge path using the same yaw convention as engine localization.
+
+        Engine forward axis in radar-local frame is +Y. In world 2D, forward unit vector:
+            vx = -sin(yaw), vy = cos(yaw)
+        For FoV boundary sweep angle a around local +Y:
+            vx(a) = -sin(yaw + a), vy(a) = cos(yaw + a)
+        """
+        from PyQt6.QtGui import QPainterPath
+        n = 60
+        half = np.deg2rad(float(fov_deg) / 2.0)
+        yaw = np.deg2rad(float(yaw_deg))
+
+        path = QPainterPath()
+        path.moveTo(x, y)
+        for i in range(n + 1):
+            a = -half + (2.0 * half * i / n)
+            ang = yaw + a
+            px = x + radius * (-np.sin(ang))
+            py = y + radius * ( np.cos(ang))
+            path.lineTo(px, py)
+        path.closeSubpath()
+        return path
+
+    @pyqtSlot(dict, dict, int)
+    def update_dashboard(self, occ_dict, resp_dict, frames=1):
         # Update Cards
         zone = occ_dict.get("zone", "--")
-        # print("zone: ", zone)
         
         # Highlight Logic — Dynamic Color Temperature
         if hasattr(self, 'zone_rects'):
@@ -670,14 +684,12 @@ class MainWindow(QMainWindow):
         mot_str     = occ_dict.get("motion_str", "--")
         posture_str = occ_dict.get("posture", "--")
         occ_conf    = occ_dict.get('occ_confidence', 0)
-        # Context-aware three-class display label (pipeline unchanged)
         
         mot_display = self._classify_motion_display(
             mot_str, posture_str, state, occ_conf)
 
         self.occ_card.update_values(
             Zone=zone,
-            # State=state[:20] + "..." if len(state)>20 else state,
             Confidence=f"{int(occ_conf)}%",
             Duration=occ_dict.get("duration_str", "--"),
             **{"Target Power": f"{occ_dict.get('dynamic_mag', 0):.1f} / {occ_dict.get('detection_threshold', 150.0):.1f}"}
@@ -693,7 +705,6 @@ class MainWindow(QMainWindow):
             **{"Height (Range)": height_range_str},
             Motion=mot_display
         )
-        # Pass mot_display as the motion class so the widget animation matches the label
         self.post_card.set_posture_state(posture_str, posture_conf, mot_str)
 
         fc = occ_dict.get('fall_confidence', 0)
@@ -708,39 +719,37 @@ class MainWindow(QMainWindow):
         else:
             self.occ_card.set_color(config.gui_theme.card_bg)
 
-        # Update Trends
-        self.occ_hist.pop(0)
-        self.occ_hist.append(np.clip(occ_dict.get('occ_confidence', 0)/100.0, 0, 1))
+        # Update Trends (using numpy roll for multi-frame support)
+        self.occ_hist = np.roll(self.occ_hist, -frames)
+        self.occ_hist[-frames:] = np.clip(occ_dict.get('occ_confidence', 0)/100.0, 0, 1)
         self.curve_occ.setData(self.x_axis, self.occ_hist)
         self.curve_occ_zero.setData(self.x_axis, np.zeros(len(self.occ_hist)))
 
-        self.posture_hist.pop(0)
-        self.posture_hist.append(np.clip(occ_dict.get('posture_confidence', 0)/100.0, 0, 1))
+        self.posture_hist = np.roll(self.posture_hist, -frames)
+        self.posture_hist[-frames:] = np.clip(occ_dict.get('posture_confidence', 0)/100.0, 0, 1)
         self.curve_post.setData(self.x_axis, self.posture_hist)
 
-        self.motion_hist.pop(0)
-        self.motion_hist.append(self._normalize_motion(mot_str))
+        self.motion_hist = np.roll(self.motion_hist, -frames)
+        self.motion_hist[-frames:] = self._normalize_motion(mot_str)
         self.curve_mot.setData(self.x_axis, self.motion_hist)
 
-        self.fall_hist.pop(0)
-        self.fall_hist.append(np.clip(fc/100.0, 0, 1))
+        self.fall_hist = np.roll(self.fall_hist, -frames)
+        self.fall_hist[-frames:] = np.clip(fc/100.0, 0, 1)
         self.curve_fall.setData(self.x_axis, self.fall_hist)
 
         # Update Height Trend
         z_val = occ_dict.get("Z") or 0.0
-        self.height_hist.pop(0)
-        self.height_hist.append(float(z_val))
+        self.height_hist = np.roll(self.height_hist, -frames)
+        self.height_hist[-frames:] = float(z_val)
         self.curve_height.setData(self.x_axis, self.height_hist)
 
         # Update Posture Timeline
-        # For the timeline specifically, inject 'Walking' as the top-level state
-        # instead of the physical base posture ('Standing') to show locomotion segments.
         tl_posture_str = "Walking" if mot_str == "Walking" else posture_str
         posture_code = self._posture_codes.get(tl_posture_str, 0)
-        self.posture_num_hist.pop(0)
-        self.posture_num_hist.append(posture_code)
+        self.posture_num_hist = np.roll(self.posture_num_hist, -frames)
+        self.posture_num_hist[-frames:] = posture_code
         self.curve_posture_tl.setData(self.x_axis, self.posture_num_hist)
-        # Update annotation
+
         tl_colors = {"Fallen": "#EF4444", "Unknown": "#6B7280",
                      "Lying Down": "#6366F1", "Sitting": "#14B8A6", 
                      "Standing": "#22C55E", "Walking": "#14B8A6"}
@@ -749,14 +758,14 @@ class MainWindow(QMainWindow):
         self._posture_tl_ann.setPos(0, 4.7)
 
         # Update Target Power Trends
-        self.mag_hist.pop(0)
-        self.mag_hist.append(occ_dict.get('dynamic_mag', 0.0))
+        self.mag_hist = np.roll(self.mag_hist, -frames)
+        self.mag_hist[-frames:] = occ_dict.get('dynamic_mag', 0.0)
         self.curve_mag.setData(self.x_axis, self.mag_hist)
         self.curve_mag_fill.setData(self.x_axis, np.zeros(len(self.mag_hist)))
         
         thresh_val = occ_dict.get('detection_threshold', 150.0)
-        self.thresh_hist.pop(0)
-        self.thresh_hist.append(thresh_val)
+        self.thresh_hist = np.roll(self.thresh_hist, -frames)
+        self.thresh_hist[-frames:] = thresh_val
         self.curve_thresh.setData(self.x_axis, self.thresh_hist)
 
         sel_bin = occ_dict.get('final_bin', 0)
@@ -954,7 +963,7 @@ class MainWindow(QMainWindow):
             # Update breathing info bar
             sig = resp_dict.get('live_signal', np.array([]))
             locked_bin = resp_dict.get('locked_bin', 0)
-            bin_dist = (locked_bin or 0) * config.radar.range_resolution
+            bin_dist = (locked_bin or 0) * config.hardware.range_resolution
             if is_calib:
                 self.resp_info_bar.setText(f"🎯 Bin: {locked_bin} ({bin_dist:.2f} m)   |   ⏳ Calibrating Apnea Threshold for 40 seconds...")
             else:

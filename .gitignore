@@ -1,3 +1,9 @@
 venv
-tests
 others
+tests
+__pycache__
+.pytest_cache
+data
+captures
+docs
+.mplcache

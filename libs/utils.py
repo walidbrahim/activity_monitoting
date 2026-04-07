@@ -1,14 +1,17 @@
 import requests
-from config import config
+from apps.common.gui_config import PushoverCredentials
 
 
 # TODO: Make it abstract
 def send_watch_alert(state_message):
     """Sends a push notification in the background."""
     try:
+        creds = PushoverCredentials.load()
+        if not creds:
+            return
         requests.post("https://api.pushover.net/1/messages.json", data={
-            "token": config.pushover.api_token,
-            "user": config.pushover.user_key,
+            "token": creds.api_token,
+            "user": creds.user_key,
             "message": f"Update: {state_message}",
             "title": "Room Activity Monitor",
             "sound": "intermission" # watch ping sound

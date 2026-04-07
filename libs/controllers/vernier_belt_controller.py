@@ -2,7 +2,7 @@ import threading
 import datetime
 import logging
 import time
-from libs.controllers.gdx import gdx
+# from libs.controllers.gdx import gdx
 from config import config
 
 logger = logging.getLogger(__name__)

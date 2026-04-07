@@ -1,16 +1,14 @@
 """
 test_respiration_real.py
-──────────────────────────
+─────────────────────────
 High-precision, multi-sensor respiratory monitoring test stack.
 
-Motion estimation: A+B hybrid (spectral magnitude change + phase-velocity IQR)
-with stability-gated rolling-percentile auto-calibration.
+Motion uses radar_engine output directly (motion_score + motion_str).
 Confidence: motion_factor × posture_factor displayed as a live badge.
 """
 import sys, os, multiprocessing, queue
 import numpy as np
 from scipy import signal
-from collections import deque
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget
 from PyQt6.QtCore import QTimer, Qt
@@ -20,149 +18,11 @@ import pyqtgraph as pg
 sys.path.append(os.getcwd())
 
 from libs.controllers.radarController import RadarController
-from libs.controllers.vernier_belt_controller import VernierBeltControllerThread
-from libs.controllers.witmotion_controller import WitMotionControllerThread
-from libs.pipelines.activityPipeline import ActivityPipeline
-from libs.pipelines.respirationPipeline import RespiratoryPipelineV2
+# from libs.controllers.vernier_belt_controller import VernierBeltControllerThread
+# from libs.controllers.witmotion_controller import WitMotionControllerThread
+from apps.bed_monitor.controller import BedMonitorController
 from libs.gui.posture_widget import RadarPostureItem
-from config import config
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Motion Scorer — A+B Hybrid with Stability-Gated Rolling Calibration
-# ══════════════════════════════════════════════════════════════════════════════
-class MotionScorer:
-    """
-    Score A (always available):
-        max per-bin std of |spectral_history| over the last SCORE_WIN_SEC.
-        Captures power spread across range bins — movement illuminates many bins.
-
-    Score B (after bin lock):
-        IQR of |Δphase| at the locked bin over the last SCORE_WIN_SEC.
-        Captures irregular phase jumps; breathing is periodic and bounded.
-
-    Auto-calibration:
-        Frames are admitted to the calibration pool only when the coarse
-        ActivityPipeline motion_level < restless_max AND posture_confidence > 60 %.
-        This prevents entry-phase motion from corrupting the baseline.
-
-        Threshold = 10th-percentile(pool) × FACTOR
-        → naturally tracks the "quiet breathing" floor, not the entry burst.
-    """
-
-    SCORE_WIN_SEC    = 1.0          # look-back window for A and B
-    MIN_POOL_SAMPLES = 30           # frames required before threshold is valid
-    THRESHOLD_FACTOR = 6.0          # moving ≡ 6 × quiet baseline (was 3.0)
-    MIN_THRESHOLD    = 0.5          # absolute floor (radar noise floor)
-    BLEND_FRAMES     = 5            # A→B transition blend length
-
-    def __init__(self, fps: float, restless_max: float):
-        self.fps          = fps
-        self.restless_max = restless_max
-        self._pool              = deque(maxlen=int(fps * 30))  # 30-s calibration pool
-        self._threshold         = None
-        self._is_moving         = None   # None = "Calibrating"
-        self._blend_counter     = 0
-        self._prev_bin_locked   = False
-        self._last_raw_score    = 0.0
-        self._last_norm_score   = 0.0
-
-    def reset(self):
-        self._pool.clear()
-        self._threshold       = None
-        self._is_moving       = None
-        self._blend_counter   = 0
-        self._prev_bin_locked = False
-        self._last_raw_score  = 0.0
-        self._last_norm_score = 0.0
-
-    # ── Scorers ──────────────────────────────────────────────────────────────
-    def _score_A(self, spectral_history: np.ndarray) -> float:
-        """Max per-bin std of magnitude over last SCORE_WIN_SEC frames."""
-        n = max(4, int(self.fps * self.SCORE_WIN_SEC))
-        recent = spectral_history[:, -n:]           # (bins, n)
-        per_bin_std = np.std(np.abs(recent), axis=1)
-        return float(np.max(per_bin_std))
-
-    def _score_B(self, spectral_history: np.ndarray, locked_bin: int) -> float:
-        """IQR of absolute phase velocity at locked_bin over last SCORE_WIN_SEC."""
-        n = max(5, int(self.fps * self.SCORE_WIN_SEC))
-        raw_phase  = np.angle(spectral_history[locked_bin, -n:])   # radians
-        unwrapped  = np.unwrap(raw_phase) * (180.0 / np.pi)        # deg
-        diff_phase = np.diff(unwrapped)
-        if len(diff_phase) < 4:
-            return 0.0
-        q75, q25 = np.percentile(np.abs(diff_phase), [75, 25])
-        return float(q75 - q25)
-
-    # ── Main update ───────────────────────────────────────────────────────────
-    def update(self, spectral_history: np.ndarray, locked_bin,
-               coarse_motion_level: float, posture_conf: float,
-               posture_str: str):
-        """
-        Returns
-        -------
-        raw_score    : float  — physical score (arbitrary units)
-        norm_score   : float  — score / threshold  (1.0 = boundary)
-        is_moving    : bool|None  — None while calibrating
-        state_str    : str
-        """
-        bin_locked = locked_bin is not None
-
-        # ── Compute raw score (A or B with blend) ────────────────────────────
-        sA = self._score_A(spectral_history)
-
-        if bin_locked:
-            sB = self._score_B(spectral_history, locked_bin)
-            if not self._prev_bin_locked:
-                # Just acquired lock — start blend
-                self._blend_counter = self.BLEND_FRAMES
-            if self._blend_counter > 0:
-                alpha = 1.0 - self._blend_counter / self.BLEND_FRAMES   # 0→1
-                raw = (1 - alpha) * sA + alpha * sB
-                self._blend_counter -= 1
-            else:
-                raw = sB
-        else:
-            raw = sA
-
-        self._prev_bin_locked = bin_locked
-        self._last_raw_score  = raw
-
-        # ── Stability gate for calibration pool ─────────────────────────────
-        is_stable = (
-            coarse_motion_level < self.restless_max
-            and posture_conf > 60.0
-            and posture_str not in ("Unknown",)
-        )
-        if is_stable:
-            self._pool.append(raw)
-
-        # ── Compute / update threshold ───────────────────────────────────────
-        if len(self._pool) >= self.MIN_POOL_SAMPLES:
-            baseline = float(np.percentile(list(self._pool), 10))
-            self._threshold = max(self.MIN_THRESHOLD, baseline * self.THRESHOLD_FACTOR)
-
-        # ── Binary decision ──────────────────────────────────────────────────
-        if self._threshold is None:
-            self._is_moving = None
-            norm = self._last_norm_score  # keep last value for display
-            state_str = f"Calibrating ({len(self._pool)}/{self.MIN_POOL_SAMPLES})"
-        else:
-            norm = raw / self._threshold
-            self._is_moving = norm > 1.0
-            state_str = "Moving" if self._is_moving else "Still"
-
-        self._last_norm_score = norm
-        return raw, norm, self._is_moving, state_str
-
-    @property
-    def is_calibrated(self) -> bool:
-        return self._threshold is not None
-
-    @property
-    def is_moving(self):           # convenience
-        return self._is_moving
+from config import load_profile, ConfigFactory
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -179,14 +39,13 @@ POSTURE_FACTORS = {
 def compute_confidence(norm_score: float, posture_str: str) -> float:
     """Returns 0–100 % signal quality.
 
-    Motion factor uses a dead-band:
-      - norm_score ≤ LOWER_BAND (0.7)  → factor = 1.0  (no penalty)
-      - norm_score   LOWER_BAND..UPPER_BAND → linear decay 1.0 → 0.0
-      - norm_score ≥ UPPER_BAND (2.0)  → factor = 0.0
-    This prevents small breathing fluctuations from degrading confidence.
+    Motion factor uses engine motion_score [0, 1] with a dead-band:
+      - score ≤ LOWER_BAND (0.20)  → factor = 1.0
+      - score in LOWER_BAND..UPPER_BAND (0.85) → linear decay 1.0 → 0.0
+      - score ≥ UPPER_BAND         → factor = 0.0
     """
-    LOWER_BAND = 0.7   # below this: perfect confidence
-    UPPER_BAND = 2.0   # above this: zero confidence
+    LOWER_BAND = 0.20
+    UPPER_BAND = 0.85
     if norm_score <= LOWER_BAND:
         motion_factor = 1.0
     elif norm_score >= UPPER_BAND:
@@ -216,13 +75,28 @@ class RespirationMonitorApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        print("Initializing Optimized Respiration Monitor (PyQt6)...")
+        print("Initializing Optimized Respiration Monitor ...")
 
         self.state_q  = multiprocessing.Queue()
         self.pt_fft_q = multiprocessing.Queue()
 
-        self.fps              = config.radar.frame_rate
-        self.window_sec       = config.respiration.resp_window_sec
+        # ── Configuration (Layered Architecture) ──────────────────────────────
+        base_profile = "profiles/base.yaml"
+        selected = os.getenv("APP_PROFILE", "home").strip()
+        if selected in ("", "base", "base.yaml", base_profile):
+            profile_stack = [base_profile]
+        else:
+            overlay = selected if selected.endswith(".yaml") else f"{selected}.yaml"
+            if "/" not in overlay:
+                overlay = f"profiles/{overlay}"
+            profile_stack = [base_profile, overlay]
+
+        self.app_cfg = load_profile(*profile_stack)
+        self.eng_cfg = ConfigFactory.engine_config(self.app_cfg)
+        print(f"Successfully loaded configuration stack: {profile_stack}")
+
+        self.fps               = float(self.eng_cfg.hardware.frame_rate)
+        self.window_sec        = float(self.eng_cfg.respiration.window_sec)
         self.radar_frame_count = int(self.window_sec * self.fps)
 
         # ── Radar ─────────────────────────────────────────────────────────────
@@ -230,22 +104,26 @@ class RespirationMonitorApp(QMainWindow):
         self.radar_process.start()
 
         # ── Vernier Belt ──────────────────────────────────────────────────────
-        self.vernier_belt_realtime_q = queue.Queue()
+        self.vernier_belt_realtime_q = multiprocessing.Queue()
         self.belt_thread = None
-        if config.vernier.enabled:
+        if self.app_cfg.vernier.enabled:
+            from libs.controllers.vernier_belt_controller import VernierBeltControllerThread
             self.belt_thread = VernierBeltControllerThread(
                 vernier_belt_realtime_q=self.vernier_belt_realtime_q,
-                vernier_belt_connection_q=queue.Queue(),
-                start_vernier_belt_q=queue.Queue()
+                vernier_belt_connection_q=multiprocessing.Queue(),
+                start_vernier_belt_q=multiprocessing.Queue(),
+                sensors=self.app_cfg.vernier.sensors,
+                period=int(1000/self.app_cfg.vernier.rate_hz)
             )
             self.belt_thread.start()
             self.belt_thread.start_vernier_belt_q.put(True)
 
         # ── WitMotion IMUs ────────────────────────────────────────────────────
         self.imu_threads, self.imu_queues = [], []
-        for imu_cfg in [config.witmotion1, config.witmotion2]:
+        for imu_cfg in [self.app_cfg.witmotion1, self.app_cfg.witmotion2]:
             if imu_cfg.enabled:
-                q, cmd_q = queue.Queue(maxsize=1000), queue.Queue()
+                from libs.controllers.witmotion_controller import WitMotionControllerThread
+                q, cmd_q = multiprocessing.Queue(maxsize=1000), multiprocessing.Queue()
                 t = WitMotionControllerThread(
                     witmotion_mac=imu_cfg.mac,
                     witmotion_realtime_q=q,
@@ -256,12 +134,29 @@ class RespirationMonitorApp(QMainWindow):
                 self.imu_threads.append(t)
                 self.imu_queues.append(q)
 
-        # ── Pipelines ─────────────────────────────────────────────────────────
-        self.act_pipeline  = ActivityPipeline(config.radar.range_idx_num, config.radar.range_resolution)
-        self.resp_pipeline = RespiratoryPipelineV2()
+        # ── Background Process Thread (New Architecture) ──────────────────────
+        self.processor = BedMonitorController(
+            pt_fft_q=self.pt_fft_q,
+            vernier_belt_realtime_q=self.vernier_belt_realtime_q,
+            cfg=self.eng_cfg,
+            belt_window_sec=self.window_sec,
+            belt_rate_hz=getattr(self.app_cfg.vernier, 'rate_hz', 10.0),
+            recording_cfg=self.app_cfg.recording.model_dump(),
+            db_cfg=self.app_cfg.database.model_dump(),
+        )
+        self.processor.data_ready.connect(self.on_data_ready)
 
-        # ── Motion Scorer ─────────────────────────────────────────────────────
-        self.motion_scorer = MotionScorer(self.fps, config.motion.restless_max)
+        # Apply configured default radar pose at startup so localization uses
+        # the intended coordinate transform from the first frame.
+        default_zone = getattr(self.app_cfg.app, "default_radar_pose", "Room")
+        default_pose = self.app_cfg.layout.get(default_zone, {}).get("radar_pose")
+        if isinstance(default_pose, dict):
+            self.processor.update_radar_pose(default_pose)
+
+        # ── Engine motion-score decision boundary ─────────────────────────────
+        rest_max = float(self.eng_cfg.activity.motion.rest_max)
+        restless_max = max(float(self.eng_cfg.activity.motion.restless_max), 1e-9)
+        self.motion_moving_threshold = min(1.0, max(0.0, rest_max / restless_max))
 
         # ── Display Buffers ───────────────────────────────────────────────────
         N = self.radar_frame_count
@@ -269,17 +164,17 @@ class RespirationMonitorApp(QMainWindow):
         self.rr_history           = np.zeros(N)
         self.conf_history         = np.zeros(N)   # 0–100
         self.height_history       = np.zeros(N)   # Z height
-        self.motion_norm_hist     = np.zeros(N)   # normalized score (threshold=1.0)
+        self.motion_norm_hist     = np.zeros(N)   # engine motion_score [0, 1]
         self.bin_history          = np.zeros(N)
         self.posture_history      = np.zeros(N)
 
-        belt_n = int(self.window_sec * config.vernier.rate_hz)
+        belt_n = int(self.window_sec * self.app_cfg.vernier.rate_hz)
         self.belt_display_buffer = np.zeros(belt_n)
 
         self.imu_buffers     = []
         self.imu_offset_emas = []
         self.imu_scale_emas  = []
-        for imu_cfg in [config.witmotion1, config.witmotion2]:
+        for imu_cfg in [self.app_cfg.witmotion1, self.app_cfg.witmotion2]:
             if imu_cfg.enabled:
                 self.imu_buffers.append(np.zeros(int(self.window_sec * imu_cfg.rate_hz)))
                 self.imu_offset_emas.append(None)
@@ -297,7 +192,8 @@ class RespirationMonitorApp(QMainWindow):
         self._last_zone       = "No Occupant Detected"
         self._last_rr         = 0.0
         self._last_conf       = 0.0
-        self._last_motion_str = "Calibrating"
+        self._last_motion_str = "Unknown"
+        self._last_is_moving  = None
         self._last_bin        = 0
         self._last_posture    = "Unknown"
 
@@ -322,9 +218,16 @@ class RespirationMonitorApp(QMainWindow):
         self._last_depth    = "--"
         self._last_cycles   = 0
 
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_loop)
-        self.timer.start(33)
+        # ── 6. Final UI Setup
+        self._update_status_bar()
+        
+        # Start Engine
+        self.processor.start()
+        
+        # UI Refresh Timer (only for sensor queues not handled by RadarEngine)
+        self.ui_timer = QTimer()
+        self.ui_timer.timeout.connect(self.poll_sensor_queues)
+        self.ui_timer.start(40) # 25 fps UI feel
 
     # ═══════════════════════════════════════════════════════════════════════════
     def init_ui(self):
@@ -386,7 +289,7 @@ class RespirationMonitorApp(QMainWindow):
         self.curve_radar = self.plot_comparison.plot(
             pen=pg.mkPen(QColor(34, 211, 238, 200), width=2), name="Radar")
         self.curve_belt = None
-        if config.vernier.enabled:
+        if self.app_cfg.vernier.enabled:
             # Curve added to secondary ViewBox
             self.curve_belt = pg.PlotCurveItem(
                 pen=pg.mkPen('#FACC15', width=1.2), name="Belt")
@@ -462,7 +365,7 @@ class RespirationMonitorApp(QMainWindow):
 
         # ── Plot 3: Motion State (normalized score + threshold line) ─────────
         self.plot_motion = mkplot(
-            "Motion Score (normalized — threshold = 1.0)", ylabel="Norm. Score")
+            "Motion Score (engine output 0–1)", ylabel="Motion Score")
         layout.addWidget(self.plot_motion, stretch=1)
         # Filled area above threshold becomes red, below is purple
         self.curve_motion_raw = self.plot_motion.plot(
@@ -470,12 +373,12 @@ class RespirationMonitorApp(QMainWindow):
             fillLevel=0, brush=pg.mkBrush(168, 85, 247, 50)
         )
         self.line_motion_thresh = pg.InfiniteLine(
-            pos=1.0, angle=0,
+            pos=self.motion_moving_threshold, angle=0,
             pen=pg.mkPen('#F59E0B', width=1.5, style=Qt.PenStyle.DashLine),
             label="Moving Threshold"
         )
         self.plot_motion.addItem(self.line_motion_thresh)
-        self.motion_state_text = pg.TextItem("Calibrating...", color='#94A3B8', anchor=(0, 0))
+        self.motion_state_text = pg.TextItem("Waiting for target...", color='#94A3B8', anchor=(0, 0))
         self.motion_state_text.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         self.motion_state_text.setPos(-29, 2)
         self.plot_motion.addItem(self.motion_state_text)
@@ -545,7 +448,7 @@ class RespirationMonitorApp(QMainWindow):
 
         self.plot_bin = mkplot("Locked Range Bin", ylabel="Bin Index")
         self.curve_bin = self.plot_bin.plot(pen=pg.mkPen('#10B981', width=1.5))
-        self.plot_bin.setYRange(0, config.radar.range_idx_num)
+        self.plot_bin.setYRange(0, self.eng_cfg.hardware.num_range_bins)
         self.tab_widget.addTab(self.plot_bin, "Range Tracking")
 
         self.plot_height = mkplot("Height History (Z)", ylabel="Height (m)")
@@ -558,13 +461,13 @@ class RespirationMonitorApp(QMainWindow):
         
         # Posture thresholds
         self.line_sit = pg.InfiniteLine(
-            pos=config.posture.sitting_threshold, angle=0,
+            pos=self.eng_cfg.activity.posture.sitting_threshold_m, angle=0,
             pen=pg.mkPen('#F59E0B', width=1.5, style=Qt.PenStyle.DashLine),
-            label=f"Sit ({config.posture.sitting_threshold}m)")
+            label=f"Sit ({self.eng_cfg.activity.posture.sitting_threshold_m}m)")
         self.line_stand = pg.InfiniteLine(
-            pos=config.posture.standing_threshold, angle=0,
+            pos=self.eng_cfg.activity.posture.standing_threshold_m, angle=0,
             pen=pg.mkPen('#34D399', width=1.5, style=Qt.PenStyle.DashLine),
-            label=f"Stand ({config.posture.standing_threshold}m)")
+            label=f"Stand ({self.eng_cfg.activity.posture.standing_threshold_m}m)")
         self.plot_height.addItem(self.line_sit)
         self.plot_height.addItem(self.line_stand)
         
@@ -587,105 +490,19 @@ class RespirationMonitorApp(QMainWindow):
 
         # Status bar styling removed (redundant)
 
-
-
-    # ═════════════════════════════════════════════════════════════════════════
-    #  Helpers
-    # ═════════════════════════════════════════════════════════════════════════
-    def _reset_all(self):
-        N = self.radar_frame_count
-        self.radar_display_buffer.fill(0)
-        self.belt_display_buffer.fill(0)
-        for b in self.imu_buffers: b.fill(0)
-        self.rr_history.fill(0)
-        self.conf_history.fill(0)
-        self.height_history.fill(0)
-        self.motion_norm_hist.fill(0)
-        self.bin_history.fill(0)
-        self.posture_history.fill(0)
-
-        self.radar_scale_locked = False
-        self.radar_scale_value  = 1.0
-        self.radar_scale_frames = 0
-        self.motion_scorer.reset()
-        self.resp_pipeline._reset_state()
-
-        self.scatter_inhales.clear()
-        self.scatter_exhales.clear()
-        for r in self._apnea_regions:
-            self.plot_comparison.removeItem(r)
-        self._apnea_regions.clear()
-        for r in self._apnea_regions_deriv:
-            self.plot_deriv.removeItem(r)
-        self._apnea_regions_deriv.clear()
-        self.ann_rr.setText("RR: -- BPM")
-        self.ann_quality.setText("")
-        self.ann_apnea.setText("")
-        self.ann_cycles.setText("")
-        self.ann_brv.setText("")
-        self.motion_state_text.setText("Calibrating...")
-
-    def _update_info_label(self):
-        """Rich-text metrics panel in the right column."""
-        apnea_txt = (
-            "<span style='color:#EF4444'>⚠ APNEA</span>"
-            if getattr(self, '_apnea_active', False) else
-            "<span style='color:#475569'>—</span>"
-        )
-        rr_col   = '#F43F5E' if self._last_rr > 0 else '#475569'
-        q        = getattr(self, '_last_conf', 0.0)
-        q_col    = '#10B981' if q >= 70 else ('#F59E0B' if q >= 40 else '#EF4444')
-        depth    = getattr(self, '_last_depth',  '--')
-        cycles   = getattr(self, '_last_cycles', 0)
-        html = (
-            "<div style='font-family:Arial; font-size:13px; line-height:2.0;'>"
-            f"<b style='color:#38BDF8'>Zone</b>: <span style='color:#E2E8F0'>{self._last_zone}</span><br>"
-            f"<b style='color:{rr_col}'>RR</b>: <span style='color:#E2E8F0'>{self._last_rr:.1f} BPM</span><br>"
-            f"<b style='color:{q_col}'>Quality</b>: <span style='color:#E2E8F0'>{q:.0f}%</span><br>"
-            f"<b style='color:#A855F7'>Motion</b>: <span style='color:#E2E8F0'>{self._last_motion_str}</span><br>"
-            f"<b style='color:#CBD5E1'>Posture</b>: <span style='color:#E2E8F0'>{self._last_posture}</span><br>"
-            f"<b style='color:#94A3B8'>Depth</b>: <span style='color:#E2E8F0'>{depth}</span> "
-            f"&nbsp;&nbsp;<b style='color:#94A3B8'>Cycles</b>: <span style='color:#E2E8F0'>{cycles}</span><br>"
-            f"<b style='color:#FB923C'>Apnea</b>: {apnea_txt}"
-            "</div>"
-        )
-        self.info_label.setText(html)
-
-    def _update_status_bar(self):
-        # self.statusBar().showMessage(...) removed (redundant)
-        self._update_info_label()
-
-    def _update_camera(self):
-        """Grab one frame from the webcam and push it to camera_label."""
-        if self._camera_cap is None or self._cv2 is None:
-            return
-        ret, frame = self._camera_cap.read()
-        if not ret:
-            return
-        # Convert BGR→RGB and copy the bytes so the QImage owns its data
-        frame_rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
-        h, w, ch = frame_rgb.shape
-        img = QImage(frame_rgb.tobytes(), w, h, ch * w,
-                     QImage.Format.Format_RGB888)
-        pix = QPixmap.fromImage(img).scaled(
-            self.camera_label.width(), self.camera_label.height(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation)
-        self.camera_label.setPixmap(pix)
-
-    # ═════════════════════════════════════════════════════════════════════════
-    #  Main Timer Loop
-    # ═════════════════════════════════════════════════════════════════════════
-    def update_loop(self):
+    # ══════════════════════════════════════════════════════════════════════
+    def poll_sensor_queues(self):
+        """Drains non-radar sensors (IMUs, Belt) that are not managed by the BedMonitorController."""
         self._update_camera()
-        # ── IMUs (always stream) ──────────────────────────────────────────────
+        
+        # ── IMUs ──────────────────────────────────────────────────────────────
         for i, q in enumerate(self.imu_queues):
             samples = []
             while not q.empty():
                 try: samples.append(q.get_nowait())
                 except queue.Empty: break
             if samples:
-                z   = [s[2] for s in samples]
+                z = [s[2] for s in samples]
                 med = np.median(z); p2p = max(z) - min(z)
                 if self.imu_offset_emas[i] is None:
                     self.imu_offset_emas[i] = med
@@ -700,72 +517,63 @@ class RespirationMonitorApp(QMainWindow):
                 if len(nz) > len(buf): nz = nz[-len(buf):]
                 self.imu_buffers[i] = np.roll(buf, -len(nz)); self.imu_buffers[i][-len(nz):] = nz
 
-        # ── Belt (always stream) ──────────────────────────────────────────────
-        if self.belt_thread:
-            chunk = []
-            while not self.vernier_belt_realtime_q.empty():
-                try: chunk.append(self.vernier_belt_realtime_q.get_nowait())
-                except queue.Empty: break
-            if chunk:
-                b = np.array(chunk)
-                self.belt_display_buffer = np.roll(self.belt_display_buffer, -len(b))
-                # Stable rolling mean removal for raw-ish force waveform
-                alpha = 0.05
-                target_mean = np.mean(b)
-                if not hasattr(self, '_belt_ema_mean'): self._belt_ema_mean = target_mean
-                self._belt_ema_mean = (1 - alpha) * self._belt_ema_mean + alpha * target_mean
-                self.belt_display_buffer[-len(b):] = (b - self._belt_ema_mean)
+        self._update_status_bar()
 
-        # ── Radar frames ──────────────────────────────────────────────────────
-        frames = 0
-        while True:
-            try: self.act_pipeline.process_frame(self.pt_fft_q.get_nowait()); frames += 1
-            except queue.Empty: break
-        if frames == 0:
-            self._update_status_bar(); return
-
-        out = self.act_pipeline.output_dict
+    def on_data_ready(self, out, resp_out, frames):
+        """Event-driven update slot called whenever the RadarEngine finishes a frame batch."""
         zone         = out.get('zone', "No Occupant Detected")
         is_valid     = out.get('is_valid', False)
         self._last_zone = zone
 
         # ── Bed-zone gate ─────────────────────────────────────────────────────
-        pipeline_ready = 'final_bin' in out and 'spectral_history' in out
+        spectral_hist = out.get('spectral_history')
+        pipeline_ready = out.get('final_bin') is not None and spectral_hist is not None
         is_in_bed = is_valid and ("Bed" in zone) and pipeline_ready
 
         if not is_in_bed:
             if self._in_bed:
-                self._in_bed = False; self._reset_all()
+                self._in_bed = False
+                self._reset_all()
             self.warning_text.show()
             self._update_status_bar()
-            self.update_plots(None, None); return
+            self.update_plots(None, None)
+            return
 
         if not self._in_bed:
-            self._in_bed = True; self._reset_all()
+            self._in_bed = True
+            self._reset_all()
         self.warning_text.hide()
 
-        # ── Motion scoring (A+B hybrid) ───────────────────────────────────────
+        # ── Motion from radar_engine (no GUI-side rescoring) ─────────────────
         locked_bin     = out.get('final_bin')
-        spectral_hist  = out['spectral_history']
-        coarse_motion  = self.act_pipeline.motion_level
-        posture_conf   = out.get('posture_confidence', 0.0)
+        motion_score   = float(out.get('motion_score', out.get('motion_level', 0.0)) or 0.0)
+        motion_score   = min(1.0, max(0.0, motion_score))
         posture_str    = out.get('posture', "Unknown")
-        if posture_str == "Fallen": posture_str = "Lying Down"
+        motion_label   = str(out.get('motion_str', "Unknown"))
+        if posture_str == "Fallen":
+            posture_str = "Lying Down"
 
-        raw_score, norm_score, is_moving, motion_str = self.motion_scorer.update(
-            spectral_hist, locked_bin, coarse_motion, posture_conf, posture_str)
+        label_low = motion_label.lower()
+        is_moving = (
+            motion_score >= self.motion_moving_threshold
+            or ("walking" in label_low)
+            or ("shifting" in label_low)
+            or ("movement" in label_low)
+        )
+        motion_state = "Moving" if is_moving else "Still"
+        self._last_motion_str = f"{motion_state} ({motion_label})"
+        self._last_is_moving  = is_moving
 
-        self._last_motion_str = motion_str
         self._last_bin        = int(locked_bin) if locked_bin is not None else 0
         self._last_posture    = posture_str
 
         # ── Confidence ────────────────────────────────────────────────────────
-        conf = compute_confidence(norm_score, posture_str)
+        conf = compute_confidence(motion_score, posture_str)
         self._last_conf = conf
 
         # ── Histories ─────────────────────────────────────────────────────────
         self.motion_norm_hist = np.roll(self.motion_norm_hist, -frames)
-        self.motion_norm_hist[-frames:] = norm_score
+        self.motion_norm_hist[-frames:] = motion_score
 
         self.bin_history = np.roll(self.bin_history, -frames)
         self.bin_history[-frames:] = self._last_bin
@@ -774,20 +582,18 @@ class RespirationMonitorApp(QMainWindow):
         self.posture_history = np.roll(self.posture_history, -frames)
         self.posture_history[-frames:] = p_map.get(posture_str, 0)
 
-        # ── Respiration pipeline ──────────────────────────────────────────────
-        resp_out = self.resp_pipeline.process(out, frames=frames)
-
         if resp_out and 'live_signal' in resp_out:
             sig  = resp_out['live_signal']
-            # No scaling needed — bandpass signal is already in physical units (degrees of phase)
             self.radar_display_buffer = sig
             self._last_rr  = resp_out.get('rr_current', 0.0)
             self._apnea_active = bool(resp_out.get('apnea_active', False))
             self._last_depth   = resp_out.get('depth', '--')
             self._last_cycles  = resp_out.get('cycle_count', 0)
+            belt_hist = resp_out.get('belt_history')
+            if belt_hist is not None:
+                self.belt_display_buffer = np.asarray(belt_hist).copy()
 
-        # RR history (update only when confident enough → Option B)
-        # Always update buffer but mask low-confidence frames with NaN for display
+        # RR history
         rr_val = resp_out.get('rr_current', 0.0) if resp_out else 0.0
         self.rr_history = np.roll(self.rr_history, -frames)
         self.rr_history[-frames:] = rr_val
@@ -821,15 +627,12 @@ class RespirationMonitorApp(QMainWindow):
             crv.setData(ti, self.imu_buffers[i])
 
         # Confidence badge
-        if self._in_bed and self.motion_scorer.is_calibrated:
+        if self._in_bed:
             c   = self._last_conf
             sym = confidence_symbol(c)
             col = confidence_color(c)
             self.ann_quality.setColor(col)
             self.ann_quality.setText(f"{sym} Signal Quality: {c:.0f}%")
-        elif self._in_bed:
-            self.ann_quality.setColor('#94A3B8')
-            self.ann_quality.setText("⏳ Calibrating motion...")
 
         # Update Calibration Status Badge
         is_calib  = resp_out.get('is_calibrating', False) if resp_out else True
@@ -935,11 +738,11 @@ class RespirationMonitorApp(QMainWindow):
         self.curve_motion_raw.setData(t_r, self.motion_norm_hist)
         # Update state label
         col_map = {True: '#F59E0B', False: '#10B981', None: '#94A3B8'}
-        col = col_map.get(self.motion_scorer.is_moving, '#94A3B8')
+        col = col_map.get(self._last_is_moving, '#94A3B8')
         self.motion_state_text.setColor(col)
         self.motion_state_text.setText(self._last_motion_str)
         # Adjust Y range to always show threshold
-        top = max(2.0, float(np.max(self.motion_norm_hist)) * 1.15)
+        top = max(1.0, float(np.max(self.motion_norm_hist)) * 1.15)
         self.plot_motion.setYRange(0, top, padding=0)
 
         # ── 4. Bin + Posture ──────────────────────────────────────────────────
@@ -952,7 +755,7 @@ class RespirationMonitorApp(QMainWindow):
             self.curve_deriv.setData(t_r, deriv_signal)
 
         # Update apnea threshold line from live pipeline value
-        thresh = getattr(self.resp_pipeline, 'apnea_threshold', 0.2)
+        thresh = resp_out.get('apnea_threshold', 0.2) if resp_out else 0.2
         self.line_apnea_thresh.setValue(thresh)
 
         # Apnea overlay on derivative plot
@@ -987,9 +790,81 @@ class RespirationMonitorApp(QMainWindow):
                 out_dict.get('motion_str', "Resting")
             )
 
+    def _reset_all(self):
+        """Reset rolling buffers and transient UI state when target leaves bed."""
+        self.radar_display_buffer.fill(0.0)
+        self.rr_history.fill(0.0)
+        self.conf_history.fill(0.0)
+        self.height_history.fill(0.0)
+        self.motion_norm_hist.fill(0.0)
+        self.bin_history.fill(0.0)
+        self.posture_history.fill(0.0)
+
+        if hasattr(self, "belt_display_buffer"):
+            self.belt_display_buffer.fill(0.0)
+
+        self._last_rr = 0.0
+        self._last_conf = 0.0
+        self._last_motion_str = "Unknown"
+        self._last_is_moving = None
+        self._last_bin = 0
+        self._last_posture = "Unknown"
+        self._apnea_active = False
+        self._last_depth = "--"
+        self._last_cycles = 0
+
+        self.scatter_inhales.clear()
+        self.scatter_exhales.clear()
+        for r in self._apnea_regions:
+            self.plot_comparison.removeItem(r)
+        self._apnea_regions.clear()
+        for r in self._apnea_regions_deriv:
+            self.plot_deriv.removeItem(r)
+        self._apnea_regions_deriv.clear()
+
+    def _update_camera(self):
+        """Grab a camera frame (if available) and paint it into camera_label."""
+        if self._camera_cap is None:
+            return
+        ok, frame = self._camera_cap.read()
+        if not ok or frame is None:
+            return
+        if self._cv2 is not None:
+            frame = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+        h, w, ch = frame.shape
+        img = QImage(frame.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(img).scaled(
+            self.camera_label.width(),
+            self.camera_label.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.camera_label.setPixmap(pix)
+
+    def _update_status_bar(self):
+        """Update right-side info panel text."""
+        in_bed = "Yes" if self._in_bed else "No"
+        rr_text = f"{self._last_rr:.1f} BPM" if self._last_rr > 0 else "--"
+        conf_text = f"{self._last_conf:.0f}%"
+        apnea_text = "Active" if self._apnea_active else "No"
+        self.info_label.setText(
+            "<b>Live Status</b><br/>"
+            f"Zone: <b>{self._last_zone}</b><br/>"
+            f"In Bed: <b>{in_bed}</b><br/>"
+            f"Posture: <b>{self._last_posture}</b><br/>"
+            f"Motion: <b>{self._last_motion_str}</b><br/>"
+            f"RR: <b>{rr_text}</b><br/>"
+            f"Signal Quality: <b>{conf_text}</b><br/>"
+            f"Apnea: <b>{apnea_text}</b><br/>"
+            f"Breath Depth: <b>{self._last_depth}</b><br/>"
+            f"Cycles: <b>{self._last_cycles}</b>"
+        )
+
     # ═════════════════════════════════════════════════════════════════════════
     def closeEvent(self, event):
         print("Cleaning up threads...")
+        if hasattr(self, "processor") and self.processor is not None:
+            self.processor.stop()
         self.radar_process.terminate()
         for t in self.imu_threads: t.stop()
         if self.belt_thread: self.belt_thread.stop()

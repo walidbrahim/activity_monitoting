@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# profiles/bedroom.yaml — Example room-specific overlay
+#
+# Usage:
+#   cfg = load_profile("profiles/base.yaml", "profiles/bedroom.yaml")
+#
+# Only keys that differ from base.yaml need to be listed.
+# Deep merge: nested dicts are merged key-by-key, not replaced wholesale.
+# ─────────────────────────────────────────────────────────────────────────────
+
+hardware:
+  ti_serial:
+    mac_cli:  "/dev/cu.usbserial-00E2410B0"
+    mac_data: "/dev/cu.usbserial-00E2410B1"
+
+layout:
+  Room:
+    x: [0, 3]
+    y: [0, 4]
+    z: [0.0, 2.7]
+    radar_pose:
+      x: 3
+      y: 4
+      z: 1.2
+      yaw_deg: 225
+      pitch_deg: -20
+      fov_deg: 120
+
+  Bed:
+    x: [0.6, 2.2]
+    y: [0.5, 3.0]
+    z: [0.0, 2.0]
+    margin_x: [0.2, 0.2]
+    margin_y: [0.2, 0.2]
+    radar_pose:
+      x: 3
+      y: 4
+      z: 1.2
+      yaw_deg: 225
+      pitch_deg: -20
+      fov_deg: 120
+
+app:
+  default_radar_pose: "Bed"
+  send_alert: true
+
+# Developer overrides for this room (leave empty in production)
+tuning: {}

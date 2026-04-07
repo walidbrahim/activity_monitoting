@@ -1,0 +1,290 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# profiles/base.yaml — Canonical base profile
+#
+# Purpose: default values for every engine parameter.
+# Usage:   load_profile("profiles/base.yaml")
+#          load_profile("profiles/base.yaml", "profiles/bedroom.yaml")
+#
+# Override rules:
+#   - Load multiple profiles left-to-right; later files win (deep merge).
+#   - The optional `tuning:` section (at the bottom) takes the HIGHEST
+#     priority: any key defined there overrides the same key in its
+#     domain-specific section. Use it for rapid experimentation without
+#     touching the structured sections.
+#
+# Key mapping from legacy app_config.yaml:
+#   OLD pipeline.alpha               → preprocessing.clutter_ema_alpha
+#   OLD pipeline.static_margin       → preprocessing.static_clutter_margin
+#   OLD radar.ti_1dfft_queue_len     → preprocessing.warmup_frames
+#   OLD pipeline.use_cfar            → detection.use_cfar
+#   OLD tuning.num_candidates        → detection.num_candidates
+#   OLD tuning.min_search_range      → detection.min_search_range_m
+#   OLD pipeline.track_alpha         → tracking.track_ema_alpha
+#   OLD pipeline.frame_to_confirm_zone → activity.zone_debounce_frames
+#   OLD posture.*                    → activity.posture.*
+#   OLD motion.*                     → activity.motion.*
+#   OLD tuning.aliveness_threshold   → vitals.aliveness_threshold
+#   OLD respiration.resp_window_sec  → respiration.window_sec
+#   pushover                         → REMOVED — use env vars
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Layer 1: Hardware ─────────────────────────────────────────────────────────
+hardware:
+  source: "ti_serial"          # "ti_serial" | "dca1000" | "playback"
+  antennas: 8
+  range_bins: 35               # range_idx_num in legacy
+  range_resolution: 0.15       # metres per bin
+  frame_rate: 25               # fps
+
+  ti_serial:
+    config_file: 'profiles/60ghz_25fps_6843_8ant_15cm.txt'
+    magic_word:
+      - 0x0708050603040101
+      - 0x0708050603040102
+      - 0x0708050603040103
+      - 0x0708050603040104
+      - 0x0708050603040105
+      - 0x0708050603040106
+      - 0x0708050603040107
+      - 0x0708050603040108
+    mac_cli:   "/dev/cu.usbserial-00E2410B0"
+    mac_data:  "/dev/cu.usbserial-00E2410B1"
+    linux_cli: "/dev/ttyUSB0"
+    linux_data: "/dev/ttyUSB1"
+    win_cli:   "COM10"
+    win_data:  "COM11"
+    # Chirp characterisation (for reference / documentation)
+    start_frequency:  60
+    chirp_loop:       16
+    chirp_slope:      32
+    chirp_end_time:   36
+    adc_start:        2
+    chirp_idle_time:  15
+    adc_sample_rate:  2000
+    tx_ant:           2
+    rx_ant:           4
+
+  dca1000:              # Future — only read by Dca1000Source
+    udp_port: 4098
+    fpga_ip: "192.168.33.180"
+
+
+# ── Layer 2: Engine — Preprocessing ───────────────────────────────────────────
+preprocessing:
+  clutter_ema_alpha:     0.05    # EMA rate for clutter map (lower = more suppression)
+  static_clutter_margin: 200.0   # additive margin on clutter map → static threshold
+  warmup_frames:         25      # frames before passing data downstream
+
+  features:
+    clutter_removal:       true
+    vital_analysis:        true
+    apnea_state:           true
+    temporal_persistence:  true
+    adaptive_smoothing:    true
+    fall_posture:          true
+
+
+# ── Layer 2: Engine — Detection ────────────────────────────────────────────────
+detection:
+  use_cfar:             true
+  detection_threshold:  150.0
+  num_candidates:       15
+  min_search_range_m:   0.30
+  z_clip_min:           0.05
+  z_clip_max:           1.80
+
+
+# ── Layer 2: Engine — Tracking ─────────────────────────────────────────────────
+tracking:
+  track_ema_alpha:         0.05
+  miss_allowance:          25
+  jump_reject_distance_m:  1.0
+  coord_buffer_size:       50
+
+
+# ── Layer 2: Engine — Activity ─────────────────────────────────────────────────
+activity:
+  zone_debounce_frames:    50
+  entry_hold_seconds:      3.0
+  subzone_debounce_frames: 15
+  bin_vote_window:         7
+  continuity_ratio:        0.60
+  reflection_dip_tolerance: 5
+
+  posture:
+    sitting_threshold_m:      0.45
+    standing_threshold_m:     0.95
+    hysteresis_m:             0.05
+    transit_standing_bias_m:  0.08
+    posture_z_neighborhood_m: 0.30
+    posture_z_bias:           0.0
+    posture_transit_z_bonus:  0.15
+    fall_detection_enable:    false
+    fall_threshold_m:         0.30
+    fall_velocity_threshold:  -1.2
+    fall_cooldown_frames:     25
+
+  motion:
+    rest_max:            0.10
+    restless_max:        0.30
+    walk_window_frames:  15
+    walk_displacement_m: 0.30
+    walk_posture_conf:   90.0
+
+
+# ── Layer 2: Engine — Vital features / aliveness ───────────────────────────────
+vitals:
+  aliveness_threshold:        0.40
+  breathing_displacement_min: 0.5     # mm
+  breathing_displacement_max: 12.0    # mm
+  min_person_snr:             80.0
+  ghost_phase_threshold:      0.0005
+  macro_displacement_mm:      15.0
+  position_stability_window:  75
+  max_clutter_position_var:   0.08
+
+
+# ── Layer 2: Engine — Respiration ──────────────────────────────────────────────
+respiration_cfg:
+  window_sec:            30
+  lowpass_cutoff_hz:     0.5
+  lowpass_order:         4
+  bin_stability_sec:     2.0
+  apnea_hold_window_sec: 5.0
+  apnea_merge_gap_sec:   0.5
+  brv_history_size:      20
+  cycle_tracker_history: 5
+  resp_threshold:        0.1
+
+
+# ── Spatial layout ────────────────────────────────────────────────────────────
+layout:
+  Room:
+    type: "boundary"
+    x: [0, 2]
+    y: [0, 3]
+    z: [0.0, 2.7]
+    arm_move: [500, 500, 500, 500, 500, 500]
+    radar_pose:
+      x: 2
+      y: 3
+      z: 1.1
+      yaw_deg: 225
+      pitch_deg: -20
+      fov_deg: 120
+
+  Bed:
+    type: "monitor"
+    x: [0.5, 1.5]
+    y: [0.5, 2.5]
+    z: [0.0, 2.0]
+    margin_x: [0.2, 0.2]
+    margin_y: [0.2, 0.2]
+    arm_move: [500, 500, 200, 500, 500, 300]
+    radar_pose:
+      x: 2
+      y: 3
+      z: 1.1
+      yaw_deg: 225
+      pitch_deg: -20
+      fov_deg: 120
+
+
+# ── Layer 3/4: App runtime ─────────────────────────────────────────────────────
+app:
+  log_level: 10
+  need_send_ti_config: true
+  send_alert: false
+  enable_robot_arm: false
+  default_radar_pose: "Bed"
+
+
+# ── Layer 4: GUI theme ─────────────────────────────────────────────────────────
+gui_theme:
+  fig_bg:    "#0F172A"
+  panel_bg:  "#1E1B4B"
+  card_bg:   "#1E293B"
+  card_ok:   "#059669"
+  card_warn: "#D97706"
+  card_alert: "#DC2626"
+  text:      "#E5E7EB"
+  subtext:   "#9CA3AF"
+  grid:      "#334155"
+  bed:       "#6366F1"
+  chair:     "#14B8A6"
+  monitor:   "#6B8E7A"
+  ignore:    "#DC2626"
+  occupant:  "#22D3EE"
+  room_edge: "#CBD5E1"
+  fov:       "#EF4444"
+  radar:     "#F43F5E"
+  origin:    "#FACC15"
+
+
+# ── Peripherals ────────────────────────────────────────────────────────────────
+camera:
+  enabled: true
+  device_index: 2
+
+vernier:
+  enabled: false
+  rate_hz: 20
+  use_ble: false
+  sensors: [1]
+  model: "GDX-RB 0K203641"
+  mac: "BC:33:AC:AE:BE:35"
+
+witmotion1:
+  enabled: false
+  mac: "E4:F1:FB:36:E5:2E"
+  rate_hz: 200
+  location: "up-chest"
+  channel: "ACC"
+
+witmotion2:
+  enabled: false
+  mac: "FE:5E:58:D8:4C:64"
+  rate_hz: 200
+  location: "belly"
+  channel: "ACC"
+
+
+# ── Session recording / replay artifacts ─────────────────────────────────────
+recording:
+  enabled: false
+  output_dir: "captures"
+  session_name: ""          # optional; auto-generated when empty
+  save_raw_frames: true     # writes frames.npz (replay input)
+  save_frame_records: true  # writes frame_records.csv/json
+  save_event_log: true      # writes events.json/txt
+  recorder_capacity: 5000
+  event_capacity: 2000
+
+# ── SQLite monitoring database (session + healthcare events + RR rollups) ───
+database:
+  enabled: true
+  path: "data/monitoring.sqlite3"
+  rr_bucket_sec: 10
+  session_end_grace_sec: 10
+  subject_id: "subject_001"
+  device_id: "radar_001"
+
+
+# ── Developer override section ─────────────────────────────────────────────────
+# Any key placed here takes the HIGHEST priority over the domain section above.
+# Useful for quick experimentation without restructuring the profile.
+# In production, this section should be EMPTY.
+# Override a room-specific file (e.g. bedroom.yaml) can set keys here too.
+#
+# Example:
+#   tuning:
+#     aliveness_threshold: 0.35    # temporarily more sensitive
+#     fall_cooldown_frames: 50     # more conservative post-fall gate
+tuning: {}
+
+
+# ── Notification secrets: NOT here ─────────────────────────────────────────────
+# Use environment variables:
+#   PUSHOVER_USER_KEY=<your-key>
+#   PUSHOVER_API_TOKEN=<your-token>

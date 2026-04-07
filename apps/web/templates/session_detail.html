@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="title">Session {{ session.id[:8] }}</h2>
+
+<div class="grid kpi">
+  <div class="card"><h3>Subject</h3><div class="value" style="font-size:18px">{{ session.subject_id }}</div></div>
+  <div class="card"><h3>Monitor Zone</h3><div class="value" style="font-size:18px">{{ session.monitor_zone }}</div></div>
+  <div class="card"><h3>Duration</h3><div class="value" style="font-size:18px">{{ session.duration_sec|dur }}</div></div>
+  <div class="card"><h3>Mean RR</h3><div class="value" style="font-size:18px">{{ "%.1f"|format(rr_summary.rr_avg or 0) }} bpm</div></div>
+  <div class="card"><h3>Apnea Time</h3><div class="value" style="font-size:18px">{{ rr_summary.apnea_total_sec|dur }}</div></div>
+  <div class="card"><h3>RR Quality</h3><div class="value" style="font-size:18px">{{ "%.2f"|format(rr_summary.quality_avg or 0) }}</div></div>
+</div>
+
+<div class="grid" style="grid-template-columns: 1.25fr 1fr; margin-top: 14px;">
+  <div class="card">
+    <h3>RR and Quality Trend</h3>
+    <canvas id="rrChart" height="120"></canvas>
+  </div>
+  <div class="card">
+    <h3>Session Metadata</h3>
+    <table>
+      <tbody>
+        <tr><th>Started</th><td>{{ session.started_at|dt }}</td></tr>
+        <tr><th>Ended</th><td>{{ session.ended_at|dt }}</td></tr>
+        <tr><th>Device</th><td>{{ session.device_id }}</td></tr>
+        <tr><th>Start Reason</th><td>{{ session.start_reason }}</td></tr>
+        <tr><th>End Reason</th><td>{{ session.end_reason or "-" }}</td></tr>
+        <tr><th>RR Range</th><td>{{ "%.1f"|format(rr_summary.rr_low or 0) }} - {{ "%.1f"|format(rr_summary.rr_high or 0) }} bpm</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:14px;">
+  <div class="card">
+    <h3>Event Breakdown</h3>
+    <canvas id="eventChart" height="120"></canvas>
+  </div>
+  <div class="card">
+    <h3>RR Buckets (Summary)</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Bucket</th><th>Mean</th><th>Min</th><th>Max</th><th>Std</th><th>Quality</th><th>Apnea(s)</th></tr>
+        </thead>
+        <tbody>
+          {% for r in rr_rows %}
+          <tr>
+            <td>{{ r.bucket_start_ts|dt }}</td>
+            <td>{{ "%.2f"|format(r.rr_mean or 0) }}</td>
+            <td>{{ "%.2f"|format(r.rr_min or 0) }}</td>
+            <td>{{ "%.2f"|format(r.rr_max or 0) }}</td>
+            <td>{{ "%.2f"|format(r.rr_std or 0) }}</td>
+            <td>{{ "%.2f"|format(r.quality_mean or 0) }}</td>
+            <td>{{ "%.1f"|format(r.apnea_seconds or 0) }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7">No RR bucket data.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:14px;">
+  <div class="toolbar">
+    <h3 style="margin:0">Healthcare Events Timeline</h3>
+    <input id="eventSearch" class="search" placeholder="Filter events..." />
+  </div>
+  <div class="table-wrap" style="max-height: 50vh;">
+    <table id="eventsTable">
+      <thead>
+        <tr><th>Time</th><th>Type</th><th>Severity</th><th>Payload</th></tr>
+      </thead>
+      <tbody>
+        {% for e in events %}
+        <tr>
+          <td>{{ e.ts|dt }}</td>
+          <td>{{ e.event_type }}</td>
+          <td><span class="badge sev-{{ e.severity }}">{{ e.severity }}</span></td>
+          <td class="mono">{{ e.payload }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4">No events in this session.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+const data = {{ rr_chart|tojson }};
+new Chart(document.getElementById('rrChart').getContext('2d'), {
+  type: 'line',
+  data: {
+    labels: data.labels,
+    datasets: [
+      { label: 'RR mean', data: data.rr_mean, borderColor: '#22d3ee', fill: false, tension: 0.2, yAxisID: 'y' },
+      { label: 'RR min', data: data.rr_min, borderColor: '#34d399', fill: false, tension: 0.2, yAxisID: 'y' },
+      { label: 'RR max', data: data.rr_max, borderColor: '#f59e0b', fill: false, tension: 0.2, yAxisID: 'y' },
+      { label: 'Quality', data: data.quality, borderColor: '#a78bfa', fill: false, tension: 0.2, yAxisID: 'y1' },
+      { label: 'Apnea sec', data: data.apnea, borderColor: '#ef4444', fill: false, tension: 0.2, yAxisID: 'y1' }
+    ]
+  },
+  options: {
+    responsive: true,
+    scales: {
+      y: { beginAtZero: true, title: { display: true, text: 'RR / BPM' } },
+      y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Quality / Apnea' } }
+    }
+  }
+});
+
+const ev = {{ event_summary|tojson }};
+new Chart(document.getElementById('eventChart').getContext('2d'), {
+  type: 'bar',
+  data: {
+    labels: ev.map(x => x.event_type),
+    datasets: [{ label: 'Events', data: ev.map(x => x.n), backgroundColor: '#7dd3fcaa', borderColor: '#22d3ee', borderWidth: 1 }]
+  },
+  options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+});
+
+const es = document.getElementById('eventSearch');
+const erows = Array.from(document.querySelectorAll('#eventsTable tbody tr'));
+es.addEventListener('input', () => {
+  const q = es.value.trim().toLowerCase();
+  erows.forEach((row) => {
+    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+{% endblock %}

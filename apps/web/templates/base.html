@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title or "Monitoring Dashboard" }}</title>
+  <style>
+    :root {
+      --bg: #08111f;
+      --bg-2: #0d1a31;
+      --panel: #111f3a;
+      --panel-2: #0f1a30;
+      --text: #e2ecff;
+      --muted: #9cb0d1;
+      --accent: #22d3ee;
+      --accent-2: #7dd3fc;
+      --ok: #34d399;
+      --warn: #f59e0b;
+      --crit: #ef4444;
+      --border: #243a63;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background:
+      radial-gradient(circle at 0% 0%, #12315f55, transparent 40%),
+      radial-gradient(circle at 100% 0%, #0ea5e933, transparent 35%),
+      linear-gradient(180deg, var(--bg-2), var(--bg)); color: var(--text); min-height: 100vh; }
+    header { padding: 14px 22px; border-bottom: 1px solid var(--border); display: flex; gap: 18px; align-items: center; background: rgba(5, 10, 20, 0.72); position: sticky; top: 0; backdrop-filter: blur(8px); z-index: 20; }
+    header a { color: var(--text); text-decoration: none; font-weight: 600; opacity: 0.9; }
+    header a:hover { color: var(--accent); opacity: 1; }
+    header .brand { font-weight: 700; color: var(--accent-2); margin-right: 8px; }
+    .container { padding: 20px; max-width: 1200px; margin: 0 auto; }
+    .grid { display: grid; gap: 14px; }
+    .grid.kpi { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+    .card { background: linear-gradient(180deg, var(--panel), var(--panel-2)); border: 1px solid var(--border); border-radius: 14px; padding: 14px; box-shadow: 0 8px 22px #01061344; }
+    .card h3 { margin: 0 0 8px 0; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .value { font-size: 26px; font-weight: 700; color: var(--accent); }
+    .sub { color: var(--muted); font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 9px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-weight: 700; }
+    tr:hover td { background: #13264a55; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+    .sev-info { background: #12384b; color: #9be3f8; }
+    .sev-warning { background: #473117; color: #ffd89b; }
+    .sev-critical { background: #4b1f25; color: #ffb5bf; }
+    .mono { font-family: ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .muted { color: var(--muted); }
+    .title { margin: 0 0 14px 0; }
+    .table-wrap { max-height: 420px; overflow: auto; border-radius: 10px; border: 1px solid #2a3f6855; }
+    .pill { display: inline-block; border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; color: var(--muted); font-size: 12px; }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+    .search { background: #0b1428; border: 1px solid var(--border); color: var(--text); border-radius: 10px; padding: 8px 10px; min-width: 260px; }
+    a.link { color: var(--accent-2); text-decoration: none; }
+    a.link:hover { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="brand">CareRadar</span>
+    <a href="/">Overview</a>
+    <a href="/sessions">Sessions</a>
+    <span style="color: var(--muted)">Monitoring Insights</span>
+  </header>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

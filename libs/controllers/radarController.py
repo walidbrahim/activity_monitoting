@@ -10,16 +10,20 @@ from config import config
 import platform
 import traceback
 
+HW = config.hardware
+TI = HW.ti_serial
+PRE = config.preprocessing
+
 # TODO: Make it configurable (Yaml file)
 if platform.system() == 'Darwin':
-    TI_CLI_SERIAL_PORT = config.radar.mac_cli
-    SERIAL_PORT_NAME = config.radar.mac_data
+    TI_CLI_SERIAL_PORT = TI.mac_cli
+    SERIAL_PORT_NAME = TI.mac_data
 elif platform.system() == 'Linux':
-    TI_CLI_SERIAL_PORT =  config.radar.linux_cli
-    SERIAL_PORT_NAME = config.radar.linux_data
+    TI_CLI_SERIAL_PORT = TI.linux_cli
+    SERIAL_PORT_NAME = TI.linux_data
 else:
-    TI_CLI_SERIAL_PORT =  config.radar.win_cli
-    SERIAL_PORT_NAME = config.radar.win_data
+    TI_CLI_SERIAL_PORT = TI.win_cli
+    SERIAL_PORT_NAME = TI.win_data
 
 class WisSerial:
     def __init__(self, port=SERIAL_PORT_NAME, baudrate=921600):
@@ -80,14 +84,14 @@ class RadarController(multiprocessing.Process):
         self.pt_fft_q = kwargs.get('pt_fft_q')
         self.start_radar_flag = kwargs.get('start_radar_flag')
         self.calculation_status = calculation_status
-        self.range_matrix_queue = np.zeros((0, config.radar.range_idx_num, config.radar.antennas), dtype=complex)
-        self.fft_matrix_queue = np.zeros((0, config.radar.range_idx_num, config.radar.antennas), dtype=complex)
+        self.range_matrix_queue = np.zeros((0, HW.range_bins, HW.antennas), dtype=complex)
+        self.fft_matrix_queue = np.zeros((0, HW.range_bins, HW.antennas), dtype=complex)
         self.able_to_calculate_flag = False
-        self.RangeMatrixQueueLen = config.radar.ti_1dfft_queue_len
+        self.RangeMatrixQueueLen = PRE.warmup_frames
         self.able_put_flag = False
         self.recording_flag = False
         self.order = 0
-        self.put_fft = np.zeros((config.radar.range_idx_num, config.radar.antennas), dtype=complex)
+        self.put_fft = np.zeros((HW.range_bins, HW.antennas), dtype=complex)
 
     def run(self):
         logging.basicConfig(level=config.app.log_level)
@@ -99,12 +103,25 @@ class RadarController(multiprocessing.Process):
         if is_new_config:
             ti_cli_ser = WisSerial(TI_CLI_SERIAL_PORT, baudrate=115200)
             ti_cli_ser.connect()
-            config_path = config.radar.config_file_path
+            if not ti_cli_ser.is_open():
+                print(f"Skip TI config: CLI port is not open ({TI_CLI_SERIAL_PORT})")
+                return
+            config_path = TI.config_file
             with open(config_path, 'r') as f:
                 print('\nSending Configuration to radar ...')
                 config_line = f.readline()
                 while config_line:
-                    ti_cli_ser.write(config_line)
+                    if not ti_cli_ser.is_open():
+                        print("Stop TI config send: CLI port closed during write")
+                        break
+                    try:
+                        ti_cli_ser.write(config_line)
+                    except serial.serialutil.SerialException as exc:
+                        print(f"Stop TI config send: serial error: {exc}")
+                        break
+                    except Exception as exc:
+                        print(f"Stop TI config send: unexpected write error: {exc}")
+                        break
                     time.sleep(0.1)
                     feedback = ti_cli_ser.read_buffer_line()
                     time.sleep(0.1)
@@ -148,32 +165,32 @@ class RadarController(multiprocessing.Process):
         step_size = 4
         magic = struct.unpack('Q', data[:header_length])
         timeStamp = struct.unpack('I', data[header_length:(header_length + timeLen)])      
-        if magic[0] == config.radar.magic_word[self.order]:
+        if magic[0] == TI.magic_word[self.order]:
             content_start = header_length + timeLen
-            range_matrix_real = np.zeros(config.radar.range_idx_num, dtype=int)
-            range_matrix_imag = np.zeros(config.radar.range_idx_num, dtype=int)
+            range_matrix_real = np.zeros(HW.range_bins, dtype=int)
+            range_matrix_imag = np.zeros(HW.range_bins, dtype=int)
             output_idx = 0
-            for rangeIdx in range(0, config.radar.range_idx_num * step_size, step_size):
+            for rangeIdx in range(0, HW.range_bins * step_size, step_size):
                 temp_real = struct.unpack('<h', data[(content_start + rangeIdx):(content_start + rangeIdx + 2)])
                 temp_imag = struct.unpack('<h', data[(content_start + rangeIdx + 2):(content_start + rangeIdx + 4)])
                 range_matrix_real[output_idx] = temp_real[0]
                 range_matrix_imag[output_idx] = temp_imag[0]
                 output_idx = output_idx + 1
             
-            endtimestamp = struct.unpack('I', data[(content_start+config.radar.range_idx_num*step_size):(content_start+config.radar.range_idx_num*step_size+4)])
+            endtimestamp = struct.unpack('I', data[(content_start+HW.range_bins*step_size):(content_start+HW.range_bins*step_size+4)])
 
-            range_matrix_all_ant_real = range_matrix_real.reshape(config.radar.range_idx_num, 1)
-            range_matrix_all_ant_imag = range_matrix_imag.reshape(config.radar.range_idx_num, 1)
+            range_matrix_all_ant_real = range_matrix_real.reshape(HW.range_bins, 1)
+            range_matrix_all_ant_imag = range_matrix_imag.reshape(HW.range_bins, 1)
             range_fft = range_matrix_all_ant_real + 1j * range_matrix_all_ant_imag
 
             self.put_fft[:, self.order] = range_fft.reshape(-1)
             self.order = self.order + 1
 
-            if self.order == config.radar.antennas:
+            if self.order == HW.antennas:
                 self.order = 0
                 self.pt_fft_q.put(self.put_fft)
                 
                 # Create a fresh array for the next frame to prevent overwriting data in the queue
-                self.put_fft = np.zeros((config.radar.range_idx_num, config.radar.antennas), dtype=complex)
+                self.put_fft = np.zeros((HW.range_bins, HW.antennas), dtype=complex)
         else:
             self.order = 0

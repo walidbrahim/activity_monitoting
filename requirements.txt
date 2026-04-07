@@ -15,3 +15,4 @@ hidapi
 opencv-python
 godirect
 bleak
+Flask

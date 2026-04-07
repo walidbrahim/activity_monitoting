@@ -1,0 +1,263 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="title">Home Monitoring Overview</h2>
+
+<div class="card" style="margin-bottom:14px;">
+  <div class="toolbar">
+    <form method="get" action="/" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="muted" for="dayPicker">Reference date</label>
+      <input id="dayPicker" class="search" type="date" name="day" value="{{ selected_day }}" style="min-width:180px; max-width:220px;" />
+      <button type="submit" class="pill" style="cursor:pointer; background:#0b1428; color:#dbe7ff;">Apply</button>
+      <a class="pill link" href="/" style="text-decoration:none;">Latest</a>
+    </form>
+    <span class="muted">Daily uses this date. Weekly/monthly use the corresponding period.</span>
+  </div>
+</div>
+
+<div class="grid kpi">
+  <div class="card"><h3>Total Sessions</h3><div class="value">{{ kpi.sessions_total or 0 }}</div></div>
+  <div class="card"><h3>Total Monitored Time</h3><div class="value">{{ kpi.monitored_sec_total|dur }}</div></div>
+  <div class="card"><h3>Avg Session Length</h3><div class="value">{{ kpi.avg_session_sec|dur }}</div></div>
+  <div class="card"><h3>Sessions (24h)</h3><div class="value">{{ kpi_24h.sessions_24h or 0 }}</div></div>
+  <div class="card"><h3>Apnea Events (24h)</h3><div class="value" style="color:#f59e0b">{{ apnea_24h.apnea_events_24h or 0 }}</div></div>
+  <div class="card"><h3>Critical Events (24h)</h3><div class="value" style="color:#ef4444">{{ critical_24h.critical_events_24h or 0 }}</div></div>
+</div>
+
+<div class="card" style="margin-top:14px;">
+  <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
+    <button class="pill tab-btn" data-tab="daily" style="cursor:pointer; background:#13264a; color:#dbe7ff;">Daily</button>
+    <button class="pill tab-btn" data-tab="weekly" style="cursor:pointer; background:#0b1428; color:#dbe7ff;">Weekly</button>
+    <button class="pill tab-btn" data-tab="monthly" style="cursor:pointer; background:#0b1428; color:#dbe7ff;">Monthly</button>
+  </div>
+
+  <section class="tab-panel" id="tab-daily">
+    <h3>Daily View ({{ chart_data.daily.title }})</h3>
+    <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:10px;">
+      <div class="card">
+        <h3>Hourly Averaged RR (BPM)</h3>
+        <canvas id="dailyRrChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3>Bed Entry / Exit Counts (Hourly)</h3>
+        <canvas id="dailyBedChart" height="120"></canvas>
+      </div>
+      <div class="card" style="grid-column: 1 / -1;">
+        <h3>Apnea Events and Duration (Hourly)</h3>
+        <canvas id="dailyApneaChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3>Posture Composition (Seconds per Hour)</h3>
+        <canvas id="dailyPostureChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3>Motion Score and Confidence (Hourly)</h3>
+        <canvas id="dailyStateChart" height="120"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab-panel" id="tab-weekly" style="display:none;">
+    <h3>Weekly View ({{ chart_data.weekly.title }})</h3>
+    <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:10px;">
+      <div class="card">
+        <h3>Daily Averaged RR (BPM)</h3>
+        <canvas id="weeklyRrChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3>Bed Entry / Exit Counts (Daily)</h3>
+        <canvas id="weeklyBedChart" height="120"></canvas>
+      </div>
+      <div class="card" style="grid-column: 1 / -1;">
+        <h3>Apnea Events and Duration (Daily)</h3>
+        <canvas id="weeklyApneaChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3>Posture Composition (Seconds per Day)</h3>
+        <canvas id="weeklyPostureChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3>Motion Score and Confidence (Daily)</h3>
+        <canvas id="weeklyStateChart" height="120"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab-panel" id="tab-monthly" style="display:none;">
+    <h3>Monthly View ({{ chart_data.monthly.title }})</h3>
+    <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:10px;">
+      <div class="card">
+        <h3>Daily Averaged RR (BPM)</h3>
+        <canvas id="monthlyRrChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3>Bed Entry / Exit Counts (Daily)</h3>
+        <canvas id="monthlyBedChart" height="120"></canvas>
+      </div>
+      <div class="card" style="grid-column: 1 / -1;">
+        <h3>Apnea Events and Duration (Daily)</h3>
+        <canvas id="monthlyApneaChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3>Posture Composition (Seconds per Day)</h3>
+        <canvas id="monthlyPostureChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3>Motion Score and Confidence (Daily)</h3>
+        <canvas id="monthlyStateChart" height="120"></canvas>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="card" style="margin-top:14px;">
+  <h3>Recent Sessions</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Started</th>
+          <th>Subject</th>
+          <th>Zone</th>
+          <th>Duration</th>
+          <th>ID</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in recent_sessions %}
+        <tr>
+          <td>{{ s.started_at|dt }}</td>
+          <td>{{ s.subject_id }}</td>
+          <td>{{ s.monitor_zone }}</td>
+          <td>{{ s.duration_sec|dur }}</td>
+          <td class="mono"><a class="link" href="/sessions/{{ s.id }}">{{ s.id[:8] }}</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5">No sessions yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+const c = {{ chart_data|tojson }};
+
+function rrLine(canvasId, labels, rr) {
+  return new Chart(document.getElementById(canvasId).getContext('2d'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{ label: 'Avg RR (bpm)', data: rr, borderColor: '#22d3ee', backgroundColor: '#22d3ee22', fill: true, tension: 0.25, spanGaps: true }]
+    },
+    options: { responsive: true, scales: { y: { beginAtZero: true } } }
+  });
+}
+
+function bedBars(canvasId, labels, entry, exit) {
+  return new Chart(document.getElementById(canvasId).getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Bed Entry', data: entry, backgroundColor: '#38bdf888' },
+        { label: 'Bed Exit', data: exit, backgroundColor: '#f59e0b88' }
+      ]
+    },
+    options: { responsive: true, scales: { y: { beginAtZero: true } } }
+  });
+}
+
+function apneaMixed(canvasId, labels, apneaN, apneaSec) {
+  return new Chart(document.getElementById(canvasId).getContext('2d'), {
+    data: {
+      labels,
+      datasets: [
+        { type: 'bar', label: 'Apnea Events', data: apneaN, backgroundColor: '#ef444488', yAxisID: 'y' },
+        { type: 'line', label: 'Apnea Duration (s)', data: apneaSec, borderColor: '#fb7185', backgroundColor: '#fb718522', yAxisID: 'y1', fill: true, tension: 0.25 }
+      ]
+    },
+    options: {
+      responsive: true,
+      scales: {
+        y: { beginAtZero: true, title: { display: true, text: 'Event Count' } },
+        y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Seconds' } }
+      }
+    }
+  });
+}
+
+function postureStacked(canvasId, labels, posture) {
+  return new Chart(document.getElementById(canvasId).getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Lying', data: posture.lying, backgroundColor: '#22c55e88', stack: 'posture' },
+        { label: 'Sitting', data: posture.sitting, backgroundColor: '#3b82f688', stack: 'posture' },
+        { label: 'Standing', data: posture.standing, backgroundColor: '#f59e0b88', stack: 'posture' },
+        { label: 'Fallen', data: posture.fallen, backgroundColor: '#ef444488', stack: 'posture' },
+        { label: 'Unknown', data: posture.unknown, backgroundColor: '#94a3b888', stack: 'posture' }
+      ]
+    },
+    options: { responsive: true, scales: { x: { stacked: true }, y: { beginAtZero: true, stacked: true } } }
+  });
+}
+
+function stateLines(canvasId, labels, motionScore, confidence) {
+  return new Chart(document.getElementById(canvasId).getContext('2d'), {
+    data: {
+      labels,
+      datasets: [
+        { type: 'line', label: 'Motion Score (0-1)', data: motionScore, borderColor: '#f97316', backgroundColor: '#f9731622', yAxisID: 'y', fill: true, tension: 0.25, spanGaps: true },
+        { type: 'line', label: 'Signal Conf (0-100)', data: confidence.signal, borderColor: '#22d3ee', yAxisID: 'y1', tension: 0.2, spanGaps: true },
+        { type: 'line', label: 'Posture Conf', data: confidence.posture, borderColor: '#6366f1', yAxisID: 'y1', tension: 0.2, spanGaps: true },
+        { type: 'line', label: 'Occupancy Conf', data: confidence.occupancy, borderColor: '#10b981', yAxisID: 'y1', tension: 0.2, spanGaps: true }
+      ]
+    },
+    options: {
+      responsive: true,
+      scales: {
+        y: { beginAtZero: true, max: 1.0, title: { display: true, text: 'Motion Score' } },
+        y1: { beginAtZero: true, max: 100, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Confidence' } }
+      }
+    }
+  });
+}
+
+// Daily
+rrLine('dailyRrChart', c.daily.labels, c.daily.rr);
+bedBars('dailyBedChart', c.daily.labels, c.daily.entry, c.daily.exit);
+apneaMixed('dailyApneaChart', c.daily.labels, c.daily.apnea_n, c.daily.apnea_sec);
+postureStacked('dailyPostureChart', c.daily.labels, c.daily.posture);
+stateLines('dailyStateChart', c.daily.labels, c.daily.motion_score, c.daily.confidence);
+// Weekly
+rrLine('weeklyRrChart', c.weekly.labels, c.weekly.rr);
+bedBars('weeklyBedChart', c.weekly.labels, c.weekly.entry, c.weekly.exit);
+apneaMixed('weeklyApneaChart', c.weekly.labels, c.weekly.apnea_n, c.weekly.apnea_sec);
+postureStacked('weeklyPostureChart', c.weekly.labels, c.weekly.posture);
+stateLines('weeklyStateChart', c.weekly.labels, c.weekly.motion_score, c.weekly.confidence);
+// Monthly
+rrLine('monthlyRrChart', c.monthly.labels, c.monthly.rr);
+bedBars('monthlyBedChart', c.monthly.labels, c.monthly.entry, c.monthly.exit);
+apneaMixed('monthlyApneaChart', c.monthly.labels, c.monthly.apnea_n, c.monthly.apnea_sec);
+postureStacked('monthlyPostureChart', c.monthly.labels, c.monthly.posture);
+stateLines('monthlyStateChart', c.monthly.labels, c.monthly.motion_score, c.monthly.confidence);
+
+// Tabs
+const tabBtns = document.querySelectorAll('.tab-btn');
+const panels = {
+  daily: document.getElementById('tab-daily'),
+  weekly: document.getElementById('tab-weekly'),
+  monthly: document.getElementById('tab-monthly')
+};
+tabBtns.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const key = btn.dataset.tab;
+    Object.entries(panels).forEach(([k, el]) => { el.style.display = (k === key ? '' : 'none'); });
+    tabBtns.forEach((b) => { b.style.background = '#0b1428'; });
+    btn.style.background = '#13264a';
+  });
+});
+</script>
+{% endblock %}
