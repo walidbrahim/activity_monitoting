@@ -90,20 +90,38 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A["Activity payload"] --> G1{"On-bed eligibility"}
-    G1 -- "Fail" --> H1["Reset buffers + show 'SUBJECT NOT IN BED'"]
-    G1 -- "Pass" --> H2["Continue respiration update"]
-    H2 --> MS["Motion quality scorer (A+B)"]
-    MS --> Q["Signal confidence"]
-    Q --> G2{"Confidence >= 40%?"}
-    G2 -- "Yes" --> MK1["Show inhale/exhale markers"]
-    G2 -- "No" --> MK2["Hide markers"]
-    R["Respiration payload"] --> G3{"Resp payload exists?"}
-    G3 -- "No" --> CLR["Clear apnea overlays/markers"]
-    G3 -- "Yes" --> DRAW["Draw signal + RR + derivative + apnea regions"]
-    R --> B{"Extractor calibrating?"}
-    B -- "Yes" --> S1["Badge: CALIBRATING"]
-    B -- "No" --> S2["Badge: LIVE"]
+    subgraph Occupancy Gating
+        A["Activity Payload"] --> OCC{"is_valid == True AND\n'Bed' in zone?"}
+        OCC -- "Fail" --> RST["Reset buffers & hide data\nShow 'SUBJECT NOT IN BED'"]
+    end
+
+    subgraph Motion & Posture Gating
+        OCC -- "Pass" --> MS["Motion Scorer"]
+        CM["Coarse Motion\n(motion_level)"] --> MS
+        PL["Posture Class\n(Lying, Sitting, Standing)"] --> MS
+        
+        MS --> NS["Normalized Motion Score\n(0 = Resting, >1 = Moving)"]
+        
+        NS --> CF["compute_confidence()"]
+        PL --> CF
+        
+        CF --> CONF["Final Confidence %\n(Motion factor × Posture factor)"]
+    end
+
+    subgraph Respiration Extraction & Display
+        CONF --> RESP["Respiration Pipeline `process()`"]
+        RESP --> PAY["Respiration Payload\n(RR, Apnea, Signal)"]
+        
+        PAY --> G2{"Confidence >= 40%?"}
+        G2 -- "Yes" --> MK1["Show Inhale/Exhale Markers\nUpdate + Render RR History"]
+        G2 -- "No" --> MK2["Hide Markers\nMask RR History (NaN)"]
+        
+        PAY --> DRAW["Render Waveform & Apnea Regions"]
+        
+        RESP --> B{"Extractor calibrating?"}
+        B -- "Yes" --> S1["Badge: CALIBRATING (Orange)"]
+        B -- "No" --> S2["Badge: LIVE (Green)"]
+    end
 ```
 
 ### 3.2 Respiratory signal extraction (engine)

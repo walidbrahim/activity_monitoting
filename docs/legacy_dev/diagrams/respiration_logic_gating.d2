@@ -1,80 +1,120 @@
 direction: down
 
-Input: {
-  shape: rectangle
-  label: "Inputs\nocc_dict from ActivityPipeline\n(zone, status, final_bin,\nmotion_str, spectral_history)\nframes_in_batch"
+OccupancyGating: {
+  label: "1. Occupancy Verification"
+  
+  Input: {
+    shape: rectangle
+    label: "ActivityEngine Payload"
+  }
+  
+  OccGate: {
+    shape: diamond
+    label: "is_valid AND\n'Bed' in zone ?"
+  }
+  
+  Reset: {
+    shape: rectangle
+    label: "Reset Buffers\nShow 'NOT IN BED'"
+  }
 }
 
-AppGate: {
-  shape: diamond
-  label: "ProcessorThread gate\nbase_zone type == monitor\nand status != No Occupant ?"
+MotionPostureGating: {
+  label: "2. Motion & Posture Gating"
+  
+  Scorer: {
+    shape: rectangle
+    label: "Motion Scorer\n(A+B Hybrid based on Tracker)"
+  }
+  
+  NormScore: {
+    shape: rectangle
+    label: "Normalized Motion Score\n(0 = Resting, >1 = Moving)"
+  }
+  
+  ComputeConf: {
+    shape: rectangle
+    label: "compute_confidence()\nMotion Deadband + Posture Penalty"
+  }
+  
+  PostureLabel: {
+    shape: rectangle
+    label: "Posture Class\n(Lying 1.0, Sitting 0.5, Standing 0.2)"
+  }
+  
+  FinalConf: {
+    shape: rectangle
+    label: "Final Quality %\nConf = MotionFactor * PostureFactor"
+  }
 }
 
-ResetResp: {
-  shape: rectangle
-  label: "No gate pass\nRespiratoryPipelineV2._reset_state()"
+RespPipeline: {
+  label: "3. Respiration Extraction & Display"
+
+  Extraction: {
+    shape: rectangle
+    label: "Phase Processing\n(Fusion -> Unwrap)"
+  }
+  
+  PathSplit: {
+    shape: rectangle
+    label: "Path Split"
+  }
+  
+  Bandpass: {
+    shape: rectangle
+    label: "DISPLAY PATH\nBandpass 0.05 - 0.5 Hz\nFixed physical scale"
+  }
+  
+  Derivative: {
+    shape: rectangle
+    label: "APNEA PATH\nDifference -> Lowpass -> Abs Grad"
+  }
+  
+  ApneaLogic: {
+    shape: rectangle
+    label: "Apnea Detection\nDynamic Threshold on Derivative"
+  }
+  
+  MarkerGate: {
+    shape: diamond
+    label: "Final Quality >= 40% ?"
+  }
+  
+  RenderWaves: {
+    shape: rectangle
+    label: "Always render Waveform &\nApnea Events"
+  }
+  
+  RenderMarkers: {
+    shape: rectangle
+    label: "Update RR History\nRender Inhale/Exhale Markers"
+  }
+  
+  MaskMarkers: {
+    shape: rectangle
+    label: "Mask RR History (NaN)\nHide Markers"
+  }
 }
 
-Lock: {
-  shape: rectangle
-  label: "Target lock\nif lock is None or motion_str == MACRO_PHASE\nlocked_bin = final_bin"
-}
+OccupancyGating.Input -> OccupancyGating.OccGate
+OccupancyGating.OccGate -> OccupancyGating.Reset: "No"
+OccupancyGating.OccGate -> MotionPostureGating.Scorer: "Yes"
 
-Fusion: {
-  shape: rectangle
-  label: "Signal extraction\nfused_complex = sum(spectral_history[bin-1:bin+1])"
-}
+MotionPostureGating.Scorer -> MotionPostureGating.NormScore
+MotionPostureGating.NormScore -> MotionPostureGating.ComputeConf
+MotionPostureGating.PostureLabel -> MotionPostureGating.ComputeConf
+MotionPostureGating.ComputeConf -> MotionPostureGating.FinalConf
 
-Phase: {
-  shape: rectangle
-  label: "Processing method\nunwrap_phase_Ambiguity (deg)\ndifference_data = phase diff\nlowpass Butterworth(order=4, fc=0.5Hz)"
-}
+MotionPostureGating.FinalConf -> RespPipeline.Extraction
+RespPipeline.Extraction -> RespPipeline.PathSplit
+RespPipeline.PathSplit -> RespPipeline.Bandpass
+RespPipeline.PathSplit -> RespPipeline.Derivative
 
-DisplayBuf: {
-  shape: rectangle
-  label: "Frozen display buffers\nplot_resp_buffer\nplot_deriv_buffer"
-}
+RespPipeline.Bandpass -> RespPipeline.RenderWaves
+RespPipeline.Derivative -> RespPipeline.ApneaLogic
+RespPipeline.ApneaLogic -> RespPipeline.RenderWaves
 
-CalibGate: {
-  shape: diamond
-  label: "Calibration complete?\n_global_frame_idx >= 40s * fps"
-}
-
-CalibSet: {
-  shape: rectangle
-  label: "Set dynamic apnea threshold\napnea_threshold = max(0.05, P95(derivative)*0.25)"
-}
-
-Apnea: {
-  shape: rectangle
-  label: "Apnea method\nwindow = 5s\nafter calibration:\npercentile95(derivative[-5s:]) <= apnea_threshold\n=> apnea_active"
-}
-
-RR: {
-  shape: rectangle
-  label: "RR method\npeak/trough detection on display_signal\nBreathCycleTracker update\nanchor-decay when peaks stop"
-}
-
-Depth: {
-  shape: rectangle
-  label: "Depth + BRV\ndepth from recent peak-trough amplitude\nBRV = std(cycle_durations)"
-}
-
-Out: {
-  shape: rectangle
-  label: "resp_dict\nlive_signal\nderivative_signal\nrr_current, rr_history\napnea_active, apnea_segments, apnea_count\ndepth, brv_value"
-}
-
-Input -> AppGate
-AppGate -> ResetResp: "no"
-AppGate -> Lock: "yes"
-Lock -> Fusion
-Fusion -> Phase
-Phase -> DisplayBuf
-DisplayBuf -> CalibGate
-CalibGate -> CalibSet: "yes (first time)"
-CalibGate -> Apnea: "no / already calibrated"
-CalibSet -> Apnea
-Apnea -> RR
-RR -> Depth
-Depth -> Out
+RespPipeline.RenderWaves -> RespPipeline.MarkerGate
+RespPipeline.MarkerGate -> RespPipeline.RenderMarkers: "Yes"
+RespPipeline.MarkerGate -> RespPipeline.MaskMarkers: "No"

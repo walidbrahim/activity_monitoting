@@ -1,60 +1,109 @@
 direction: down
 
-Input: {
-  shape: rectangle
-  label: "Inputs\nsmoothed track XY/Z\nmotion_level (EMA)\nmicro_state\nzone label\nXY history window"
+Inputs: {
+  label: "Inputs"
+  
+  SpecHist: {
+    shape: rectangle
+    label: "spectral_history"
+  }
+  
+  Lock: {
+    shape: rectangle
+    label: "locked_bin"
+  }
+  
+  CoarseScore: {
+    shape: rectangle
+    label: "coarse_motion_level\n(Activity Pipeline)"
+  }
+  
+  Posture: {
+    shape: rectangle
+    label: "posture_conf &\nposture_str"
+  }
 }
 
-MotionScore: {
-  shape: rectangle
-  label: "motion_level update (Step 3)\nshift_distance = ||median_xyz - track_xyz||\nmotion_level = 0.2*shift_distance + 0.8*prev"
+Scoring: {
+  label: "Raw Score Computation"
+  
+  ScoreA: {
+    shape: rectangle
+    label: "Score A (Unlocked)\nmax per-bin std of |spectral_history|"
+  }
+  
+  ScoreB: {
+    shape: rectangle
+    label: "Score B (Locked)\nIQR of |Δphase| at locked_bin"
+  }
+  
+  Blend: {
+    shape: diamond
+    label: "Lock Status ?"
+  }
+  
+  RawOut: {
+    shape: rectangle
+    label: "Raw Score\n(A, B, or 5-frame Blend)"
+  }
 }
 
-WalkCheck: {
-  shape: diamond
-  label: "Walking gate\nzone == Floor/Transit\nand XY window full\nand net displacement >= walk_displacement_m"
+AutoCalib: {
+  label: "Auto-Calibration Pool"
+  
+  StableGate: {
+    shape: diamond
+    label: "Stability Gate\ncoarse_motion < restless_max\nAND posture_conf > 60%\nAND posture_str != Unknown"
+  }
+  
+  Pool: {
+    shape: rectangle
+    label: "Append to 30s Pool\n(max size = 30 * fps)"
+  }
+  
+  ThreshCalc: {
+    shape: rectangle
+    label: "Update Threshold\n(if pool >= 30 samples)\nThreshold = max(0.5, P10(pool) * 6.0)"
+  }
 }
 
-LabelWalk: {
-  shape: rectangle
-  label: "motion_str = Walking"
+Output: {
+  label: "Binary Decision & Output"
+  
+  NormCalc: {
+    shape: rectangle
+    label: "norm_score = raw / threshold"
+  }
+  
+  Decision: {
+    shape: diamond
+    label: "norm_score > 1.0 ?"
+  }
+  
+  StateStr: {
+    shape: rectangle
+    label: "Moving vs. Still\n(or 'Calibrating')"
+  }
 }
 
-MajorCheck: { shape: diamond, label: "motion_level > restless_max ?" }
-PosturalCheck: { shape: diamond, label: "micro_state == MACRO_PHASE\nand active zone in Bed/Chair ?" }
-ShiftCheck: { shape: diamond, label: "motion_level > rest_max ?" }
-FidgetCheck: { shape: diamond, label: "micro_state == MICRO_PHASE ?" }
+Inputs.SpecHist -> Scoring.ScoreA
+Inputs.SpecHist -> Scoring.ScoreB
+Inputs.Lock -> Scoring.ScoreB
+Inputs.Lock -> Scoring.Blend
 
-LabelMajor: { shape: rectangle, label: "motion_str = Major Movement" }
-LabelPostural: { shape: rectangle, label: "motion_str = Postural Shift" }
-LabelShift: { shape: rectangle, label: "motion_str = Restless/Shifting" }
-LabelFidget: { shape: rectangle, label: "motion_str = Restless/Fidgeting" }
+Scoring.ScoreA -> Scoring.Blend
+Scoring.ScoreB -> Scoring.Blend
+Scoring.Blend -> Scoring.RawOut
 
-LabelRest: {
-  shape: rectangle
-  label: "else\nmotion_str = Resting/Breathing"
-}
+Scoring.RawOut -> AutoCalib.StableGate
+Inputs.CoarseScore -> AutoCalib.StableGate
+Inputs.Posture -> AutoCalib.StableGate
 
-Out: {
-  shape: rectangle
-  label: "Outputs\nmotion_str\nmotion_level"
-}
+AutoCalib.StableGate -> AutoCalib.Pool: "Yes"
+AutoCalib.Pool -> AutoCalib.ThreshCalc
 
-Input -> MotionScore
-MotionScore -> WalkCheck
-WalkCheck -> LabelWalk: "yes"
-WalkCheck -> MajorCheck: "no"
-MajorCheck -> LabelMajor: "yes"
-MajorCheck -> PosturalCheck: "no"
-PosturalCheck -> LabelPostural: "yes"
-PosturalCheck -> ShiftCheck: "no"
-ShiftCheck -> LabelShift: "yes"
-ShiftCheck -> FidgetCheck: "no"
-FidgetCheck -> LabelFidget: "yes"
-FidgetCheck -> LabelRest: "no"
-LabelWalk -> Out
-LabelMajor -> Out
-LabelPostural -> Out
-LabelShift -> Out
-LabelFidget -> Out
-LabelRest -> Out
+AutoCalib.ThreshCalc -> Output.NormCalc
+Scoring.RawOut -> Output.NormCalc
+
+Output.NormCalc -> Output.Decision
+Output.Decision -> Output.StateStr
