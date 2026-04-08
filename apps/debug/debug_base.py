@@ -36,6 +36,7 @@ if _ROOT not in sys.path:
 from config import load_profile, ConfigFactory, AppConfig              # noqa: E402
 from radar_engine.orchestration.engine import RadarEngine              # noqa: E402
 from radar_engine.core.models import EngineOutput                      # noqa: E402
+from radar_engine.diagnostics import FrameRecorder                     # noqa: E402
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 
@@ -90,6 +91,21 @@ QLabel#monospace   {{ font-family: 'JetBrains Mono', 'Courier New', monospace; f
 QSplitter::handle  {{ background: {PALETTE['border']}; width: 1px; }}
 QScrollBar:vertical {{ background: {PALETTE['bg']}; width: 6px; }}
 QScrollBar::handle:vertical {{ background: {PALETTE['border']}; border-radius: 3px; }}
+QPushButton {{
+    background-color: {PALETTE['card']};
+    border: 1px solid {PALETTE['border']};
+    border-radius: 6px;
+    padding: 2px 10px;
+    color: {PALETTE['text']};
+}}
+QPushButton:hover {{
+    background-color: {PALETTE['border']};
+}}
+QPushButton:checked {{
+    background-color: {PALETTE['alert']}40;
+    border-color: {PALETTE['alert']};
+    color: {PALETTE['alert']};
+}}
 """
 
 # ── pyqtgraph global defaults ─────────────────────────────────────────────────
@@ -147,8 +163,15 @@ class DebugBase(QMainWindow):
         self._num_bins   = int(self._app_cfg.hardware.range_bins)
         self._num_ant    = int(self._app_cfg.hardware.antennas)
 
-        # ── Engine ────────────────────────────────────────────────────────────
-        self.engine = RadarEngine(cfg=self._engine_cfg, with_respiration=True)
+        # ── Engine & Recorder ──────────────────────────────────────────────────
+        self.engine   = RadarEngine(cfg=self._engine_cfg, with_respiration=True)
+        self._recorder = FrameRecorder(capacity=10000)
+        self._recording = False
+        self._raw_buf   = []
+
+        # ── Parameter Tuner ───────────────────────────────────────────────────
+        self._tunable_params = []
+        self._tuner_window = None
 
         # ── Live hardware: spawn RadarController as a daemon process ──────────
         # Mirrors room_monitoring.py exactly.  Frames arrive as
@@ -178,10 +201,21 @@ class DebugBase(QMainWindow):
         else:
             status_text = "⚠  Radar hardware not connected — check serial port"
         self._fps_label = QLabel(status_text)
-        self._fps_label.setObjectName("subtext")
-        self.statusBar().addPermanentWidget(self._fps_label)
+        self._fps_label.setMinimumWidth(200)
+        self.statusBar().addWidget(self._fps_label)
+
+        # Record button
+        from PyQt6.QtWidgets import QPushButton
+        self._record_btn = QPushButton("⏺  Record Session")
+        self._record_btn.setCheckable(True)
+        self._record_btn.clicked.connect(self._toggle_recording)
+        # Tune button
+        self._tune_btn = QPushButton("⚙️ Tune Parameters")
+        self._tune_btn.clicked.connect(self._open_tuner)
+        self.statusBar().addPermanentWidget(self._tune_btn)
+
         self.statusBar().setStyleSheet(
-            f"background:{PALETTE['panel']}; color:{PALETTE['subtext']};"
+            f"background:{PALETTE['panel']}; color:{PALETTE['subtext']}; padding: 2px;"
         )
 
         # ── Build subclass UI ─────────────────────────────────────────────────
@@ -225,30 +259,59 @@ class DebugBase(QMainWindow):
     # ── Frame loop ────────────────────────────────────────────────────────────
 
     def _tick(self):
-        """Drain all queued radar frames; feed the most-recent one to the engine.
-
-        If the queue is empty this tick is skipped — the display freezes at
-        the last good frame rather than advancing with stale or fake data.
+        """Drain strictly *all* queued radar frames into the Engine immediately.
+        Only the *latest* processed output forces a GUI render.
+        This guarantees the RadarEngine strictly operates at 25 FPS even if
+        the UI falls slightly behind.
         """
         if not self._hw_ok:
-            return  # hardware never initialised — nothing to do
+            return
 
-        # Drain the entire queue; keep only the newest frame
-        latest_frame: np.ndarray | None = None
+        last_output = None
+        frames_passed = 0
         while True:
             try:
-                latest_frame = self._pt_fft_q.get_nowait()
+                frame = self._pt_fft_q.get_nowait()
+                last_output = self.engine.process_frame(frame, timestamp=time.time())
+                self._frame_idx += 1
+                frames_passed += 1
+                
+                if self._recording:
+                    self._recorder.record(last_output)
+                    self._raw_buf.append(np.array(frame, copy=True))
+                    
             except _queue.Empty:
                 break
             except Exception:
                 break
 
-        if latest_frame is None:
-            return  # no frame this tick — skip
+        if last_output is None:
+            return  # No frames arrived, so skip render
 
-        output = self.engine.process_frame(latest_frame, timestamp=time.time())
-        self._frame_idx += 1
-        self._fps_label.setText(f"Frame: {self._frame_idx}  |  📡 Live")
+        self._frames_passed_since_render = frames_passed
+        output = last_output
+        
+        base_status = f"Frame: {self._frame_idx}  |  📡 Live" + ("  🔴 RECORDING" if self._recording else "")
+        diag_stats = []
+        if output.activity:
+            diag_stats.append(f"Occ: {output.activity.occupancy.name}")
+        if output.tracked_target and output.tracked_target.valid:
+            diag_stats.append(f"Track: Bin {output.tracked_target.bin_index}")
+        else:
+            diag_stats.append(f"Track: --")
+            
+        if output.vital_features:
+            diag_stats.append(f"Vital: {output.vital_features.micro_state.name}")
+        else:
+            diag_stats.append(f"Vital: --")
+            
+        ghost = output.diagnostics.get("is_static_ghost", False)
+        if ghost:
+            diag_stats.append("👻 MASK DROPPED (Static)")
+            
+        full_status = base_status + "  |  " + "  |  ".join(diag_stats)
+        self._fps_label.setText(full_status)
+
         self.render(output)
 
     # ── Abstract interface ────────────────────────────────────────────────────
@@ -264,6 +327,108 @@ class DebugBase(QMainWindow):
     def render(self, output: EngineOutput) -> None:
         """Called every frame with the latest EngineOutput. Must be overridden."""
         ...
+
+    def _toggle_recording(self, checked: bool) -> None:
+        """Handle the Record / Stop transition and export data."""
+        from pathlib import Path
+        from PyQt6.QtWidgets import QApplication
+        if checked:
+            # Start
+            self._recorder.reset()
+            self._raw_buf = []
+            self._recording = True
+            self._record_btn.setText("⏹  Stop & Save")
+            print("[DebugBase] Recording started...")
+        else:
+            # Stop & Save
+            self._recording = False
+            self._record_btn.setText("⏳ Saving...")
+            self._record_btn.setEnabled(False)
+            QApplication.processEvents()
+
+            if self._recorder.buffered_frames > 0:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                profile = os.getenv("APP_PROFILE", "debug")
+                folder  = Path(_ROOT) / "captures" / f"{profile}_{ts}"
+                folder.mkdir(parents=True, exist_ok=True)
+                
+                csv_path = self._recorder.export_csv(folder / "frame_records.csv")
+                json_path = self._recorder.export_json(folder / "frame_records.json")
+                
+                if self._raw_buf:
+                    raw_path = folder / "frames.npz"
+                    np.savez_compressed(raw_path, frames=np.stack(self._raw_buf, axis=0))
+                
+                print(f"[DebugBase] Session saved to {folder}")
+                self.statusBar().showMessage(f"✅ Saved to: captures/{folder.name}", 5000)
+            
+            self._record_btn.setText("⏺  Record Session")
+            self._record_btn.setEnabled(True)
+
+    # ── Parameter Tuning ──────────────────────────────────────────────────────
+
+    def add_tunable_param(self, pid: str, name: str, min_val, max_val, step, default, decimals: int = 2) -> None:
+        """Register a parameter for real-time GUI tuning."""
+        self._tunable_params.append({
+            "id": pid, "name": name, "min": min_val, "max": max_val, 
+            "step": step, "default": default, "decimals": decimals
+        })
+
+    def _open_tuner(self) -> None:
+        """Launch the floating parameter tuning window."""
+        if not self._tunable_params:
+            print("[DebugBase] No tunable parameters registered for this app.")
+            self.statusBar().showMessage("⚠ No tunables registered.", 3000)
+            return
+            
+        from apps.debug.tuner_window import ParameterTunerWindow
+        if not self._tuner_window:
+            self._tuner_window = ParameterTunerWindow(self, self._tunable_params, self._apply_tuning_update, PALETTE)
+        self._tuner_window.show()
+        self._tuner_window.raise_()
+
+    def _apply_tuning_update(self, updates: dict) -> None:
+        """Apply new config and hard-reset the engine.
+
+        Since sub-configs (like PreprocessingConfig) are frozen dataclasses,
+        we must use dataclasses.replace to create updated instances.
+        """
+        from dataclasses import replace
+        print(f"\n[DebugBase] Applying live parameter update: {updates}")
+
+        # 1. Group updates by the sub-config title (e.g. 'preprocessing', 'detection')
+        category_updates = {}
+        for pid, val in updates.items():
+            cat, key = pid.split(".", 1)
+            if cat not in category_updates: category_updates[cat] = {}
+            category_updates[cat][key] = val
+
+            # Also sync the local 'default' state so the tuner UI re-opens correctly
+            for p in self._tunable_params:
+                if p["id"] == pid:
+                    p["default"] = val
+                    break
+
+        # 2. Reconstruct the frozen sub-configs and inject them into the mutable EngineConfig
+        for cat, fields in category_updates.items():
+            old_sub = getattr(self._engine_cfg, cat)
+            new_sub = replace(old_sub, **fields)
+            setattr(self._engine_cfg, cat, new_sub)
+
+        # 3. Hard reset RadarEngine with the new configuration
+        from radar_engine.orchestration.engine import RadarEngine
+        self.engine = RadarEngine(cfg=self._engine_cfg, with_respiration=True)
+        
+        # 3. Fast-forward the incoming queue to drop stale data
+        drop_count = 0
+        while not self._pt_fft_q.empty():
+            try:
+                self._pt_fft_q.get_nowait()
+                drop_count += 1
+            except:
+                break
+        
+        self.statusBar().showMessage(f"♻️ Engine Config Updated. Dropped {drop_count} stale frames.", 4000)
 
     # ── Convenience helpers ───────────────────────────────────────────────────
 

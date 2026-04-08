@@ -119,6 +119,12 @@ class TrackingDebug(DebugBase):
     _TRAIL_LEN = 100
 
     def _build_ui(self, central: QWidget) -> None:
+        # ── Setup Parameter Tuner ─────────────────────────────────────────────
+        self.add_tunable_param("tracking.max_miss_count", "Max Miss Count", 5, 500, 5, self._engine_cfg.tracking.max_miss_count, decimals=0)
+        self.add_tunable_param("tracking.confidence_threshold", "Confidence Threshold", 1, 50, 1, self._engine_cfg.tracking.confidence_threshold, decimals=0)
+        self.add_tunable_param("tracking.xyz_alpha", "XYZ Smooth Alpha", 0.01, 1.0, 0.01, self._engine_cfg.tracking.xyz_alpha, decimals=2)
+
+        # ── UI Construction ───────────────────────────────────────────────────
         main_lay = QHBoxLayout(central)
         main_lay.setContentsMargins(10, 10, 10, 10)
         main_lay.setSpacing(12)

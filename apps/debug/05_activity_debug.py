@@ -107,6 +107,12 @@ class ActivityDebug(DebugBase):
     WINDOW_H = 950
 
     def _build_ui(self, central: QWidget) -> None:
+        # ── Setup Parameter Tuner ─────────────────────────────────────────────
+        self.add_tunable_param("activity.z_standing_threshold", "Standing Z Threshold", 0.5, 2.0, 0.1, self._engine_cfg.activity.z_standing_threshold, decimals=2)
+        self.add_tunable_param("activity.z_lying_threshold", "Lying Z Threshold", 0.1, 1.5, 0.1, self._engine_cfg.activity.z_lying_threshold, decimals=2)
+        self.add_tunable_param("activity.zone_debounce_frames", "Zone Debounce Frames", 1, 100, 1, self._engine_cfg.activity.zone_debounce_frames, decimals=0)
+
+        # ── UI Construction ───────────────────────────────────────────────────
         grid = QGridLayout(central)
         grid.setContentsMargins(10, 10, 10, 10)
         grid.setSpacing(12)

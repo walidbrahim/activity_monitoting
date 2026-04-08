@@ -73,8 +73,8 @@ hardware:
 # ── Layer 2: Engine — Preprocessing ───────────────────────────────────────────
 preprocessing:
   clutter_ema_alpha:     0.05    # EMA rate for clutter map (lower = more suppression)
-  static_clutter_margin: 200.0   # additive margin on clutter map → static threshold
-  warmup_frames:         25      # frames before passing data downstream
+  static_clutter_margin: 200.0     # additive margin on clutter map → static threshold
+  warmup_frames:         250     # frames before passing data downstream
 
   features:
     clutter_removal:       true

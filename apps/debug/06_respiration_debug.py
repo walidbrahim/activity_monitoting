@@ -117,6 +117,11 @@ class RespirationDebug(DebugBase):
     _HIST_SECS = 45 # Longer window for slow breathing
 
     def _build_ui(self, central: QWidget) -> None:
+        # ── Setup Parameter Tuner ─────────────────────────────────────────────
+        self.add_tunable_param("respiration.window_sec", "Buffer Window (s)", 5, 60, 5, self._engine_cfg.respiration.window_sec, decimals=0)
+        self.add_tunable_param("respiration.apnea_time_sec", "Apnea Threshold (s)", 5.0, 30.0, 1.0, self._engine_cfg.respiration.apnea_time_sec, decimals=1)
+
+        # ── UI Construction ───────────────────────────────────────────────────
         main_lay = QHBoxLayout(central)
         main_lay.setContentsMargins(10, 10, 10, 10)
         main_lay.setSpacing(12)

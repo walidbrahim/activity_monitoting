@@ -85,6 +85,10 @@ class VitalFeaturesDebug(DebugBase):
     _HIST_SECS = 30  # View window
 
     def _build_ui(self, central: QWidget) -> None:
+        # ── Setup Parameter Tuner ─────────────────────────────────────────────
+        self.add_tunable_param("vitals.motion_threshold", "Motion Threshold", 0.0, 100.0, 1.0, self._engine_cfg.vitals.motion_threshold, decimals=1)
+
+        # ── UI Construction ───────────────────────────────────────────────────
         main_lay = QHBoxLayout(central)
         main_lay.setContentsMargins(10, 10, 10, 10)
         main_lay.setSpacing(12)

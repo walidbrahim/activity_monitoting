@@ -34,6 +34,7 @@ class ClutterMap:
         self.num_antennas = num_antennas
         self.alpha        = alpha
         self._map         = np.zeros((num_bins, num_antennas), dtype=complex)
+        self._last_alpha  = np.full(num_bins, alpha, dtype=np.float32)
 
     # ── Core update ──────────────────────────────────────────────────────────
 
@@ -46,6 +47,7 @@ class ClutterMap:
         last_target_bin:     int | None,
         track_confidence:    int,
         confidence_threshold: int,
+        target_protection:   bool = True,
     ) -> np.ndarray:
         """Update the clutter map and return the clutter-subtracted frame.
 
@@ -65,6 +67,8 @@ class ClutterMap:
             track_confidence:     Current tracker confidence counter value.
             confidence_threshold: Threshold the counter must reach to be
                                   considered confirmed.
+            target_protection:    Whether to enable spatial masking (freeze 
+                                  learning near target).
 
         Returns:
             dynamic_data: clutter_subtracted frame; same shape as corrected_data.
@@ -75,8 +79,9 @@ class ClutterMap:
 
         elif (not is_occupied or
               last_target_bin is None or
-              track_confidence < confidence_threshold):
-            # Evaporate ghosts globally while empty or unconfirmed
+              track_confidence < confidence_threshold or
+              not target_protection):
+            # Evaporate ghosts globally while empty or unconfirmed (or if protection disabled)
             current_alpha_array = np.full(self.num_bins, self.alpha)
 
         else:
@@ -88,6 +93,7 @@ class ClutterMap:
             protection_mask  = np.clip((dist_bins - 2.0) / 8.0, 0.0, 1.0)
             current_alpha_array = 0.001 + protection_mask * (self.alpha - 0.001)
 
+        self._last_alpha = current_alpha_array
         alpha_matrix = current_alpha_array[:, np.newaxis]  # broadcast over antennas
         self._map    = (alpha_matrix * corrected_data) + ((1.0 - alpha_matrix) * self._map)
 

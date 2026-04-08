@@ -35,7 +35,7 @@ import numpy as np
 from radar_engine.config.engine import EngineConfig
 from radar_engine.core.base import RadarModule, NullModule
 from radar_engine.core.context import RadarContext
-from radar_engine.core.enums import OccupancyState
+from radar_engine.core.enums import OccupancyState, MicroState
 from radar_engine.core.models import EngineOutput
 from radar_engine.preprocessing.preprocessor import RadarFramePreprocessor
 from radar_engine.detection.target_detector import TargetDetector
@@ -148,6 +148,7 @@ class RadarEngine:
                 self.adaptive_smoothing   = p.features_adaptive_smoothing
                 self.fall_posture         = p.features_fall_posture
                 self.apnea_state          = p.features_apnea_state
+                self.target_protection    = p.features_target_protection
                 self.tethering            = False
         features = _FeatureFlags(pre)
 
@@ -166,12 +167,13 @@ class RadarEngine:
         )
 
         self.detector: TargetDetector = detector or TargetDetector(
-            range_resolution = hw.range_resolution,
-            frame_rate       = hw.frame_rate,
-            R                = self._R,
-            T                = self._T,
-            features         = features,
-            zone_evaluator   = self._zone_evaluator,
+            range_resolution   = hw.range_resolution,
+            frame_rate         = hw.frame_rate,
+            R                  = self._R,
+            T                  = self._T,
+            features           = features,
+            zone_evaluator     = self._zone_evaluator,
+            min_search_range_m = det.min_search_range_m,
         )
 
         self.tracker: TargetTracker = tracker or TargetTracker(cfg=trk)
@@ -254,9 +256,42 @@ class RadarEngine:
 
         # ── 5. Update clutter masking state for next frame ─────────────────────
         tracked = ctx.tracked_target
+        is_occupied_for_mask = self.inferencer.is_occupied
+        
+        # Break the "Ghost Trap" using vital phase features instead of tracking motion.
+        # If the target is physically dead/static (e.g., a wall), drop the mask.
+        is_static_ghost = False
+        target_vital = None
+        if tracked:
+            target_vital = ctx.all_vital_features.get(tracked.bin_index)
+            
+            # Always force GUI-level deep math for the ONE explicitly tracked target.
+            # This overrides the shallow target_vital if we have spectral history available.
+            if ctx.spectral_history is not None:
+                bin_hist = ctx.spectral_history.get_bin_history(tracked.bin_index)
+                if bin_hist is not None and len(bin_hist) > 0:
+                    ch_cand = ctx.preprocessed.corrected_data[tracked.bin_index, :]
+                    target_vital = self.detector._vital_extractor.extract(
+                        bin_hist, ch_cand, tracked.bin_index, force_psd=True)
+            
+        if target_vital:
+            vs = target_vital.micro_state
+            if vs in (MicroState.STATIC_GHOST, MicroState.DEAD_SPACE):
+                is_static_ghost = True
+                is_occupied_for_mask = False
+            
+        ctx.diagnostics["is_static_ghost"] = is_static_ghost
+        ctx.diagnostics["tracked_vital"] = target_vital
+
+        tracked_bin_for_mask = None
+        if tracked and tracked.valid:
+            t_range = tracked.bin_index * self.detector.range_res
+            if t_range >= self.detector._min_search_range_m:
+                tracked_bin_for_mask = tracked.bin_index
+
         self.preprocessor.update_masking_state(
-            is_occupied      = self.inferencer.is_occupied,
-            last_target_bin  = tracked.bin_index if (tracked and tracked.valid) else None,
+            is_occupied      = is_occupied_for_mask,
+            last_target_bin  = tracked_bin_for_mask,
             track_confidence = tracked.confidence if tracked else 0,
         )
 
@@ -281,7 +316,11 @@ class RadarEngine:
                 ctx.diagnostics["respiration_eligible"] = False
                 ctx.diagnostics["respiration_skip_reason"] = "non_monitor_zone"
 
-        # ── 7. Package output ──────────────────────────────────────────────────
+        # ── 7. Inject Core Diagnostics ─────────────────────────────────────────
+        if hasattr(self.preprocessor.clutter_map, "_last_alpha"):
+            ctx.diagnostics["clutter_alpha"] = self.preprocessor.clutter_map._last_alpha
+
+        # ── 8. Package output ──────────────────────────────────────────────────
         return EngineOutput(
             timestamp           = timestamp,
             frame_index         = self._frame_index,
@@ -291,10 +330,11 @@ class RadarEngine:
             activity            = ctx.activity,
             respiration_signal  = ctx.respiration_signal,
             respiration_metrics = ctx.respiration_metrics,
+            spectral_history    = ctx.spectral_history,
             diagnostics         = {
                 k: v for k, v in ctx.diagnostics.items()
                 if not k.startswith("_")   # strip internal private keys
-            },
+            }
         )
 
     def reset(self) -> None:

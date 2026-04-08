@@ -35,7 +35,7 @@ _STATIC_GHOST_PTP          = 5.0     # degrees — essentially static
 _MECH_ROTOR_DRIFT          = 400.0   # deg — monotonic phase ramp from rotating machinery
 _MACRO_PERSIST_FRAMES      = 10      # frames macro label is held after burst
 _RESP_BAND_LOW_HZ          = 0.1
-_RESP_BAND_HIGH_HZ         = 0.8
+_RESP_BAND_HIGH_HZ         = 0.5
 
 
 class VitalFeatureExtractor:
@@ -62,6 +62,7 @@ class VitalFeatureExtractor:
         bin_history: np.ndarray,    # (num_antennas, num_frames) complex, ordered
         ch_snapshot: np.ndarray,    # (num_antennas,) complex, current-frame snapshot
         cand_bin:    int,
+        force_psd:   bool = False,
     ) -> VitalFeatures:
         """Compute VitalFeatures for one candidate range bin.
 
@@ -71,6 +72,8 @@ class VitalFeatureExtractor:
             ch_snapshot:  Current-frame antenna snapshot at the candidate bin.
                           Used to derive beamforming weights.
             cand_bin:     Range-bin index (for persistent macro_timer lookup).
+            force_psd:    If True, forces heavy _compute_aliveness math even
+                          on fast-bailout paths (used by single-target GUI).
 
         Returns:
             VitalFeatures populated with all phase/spectral/aliveness fields.
@@ -82,15 +85,24 @@ class VitalFeatureExtractor:
         # bin_history: (antennas, frames)  weights: (antennas,)
         hist_bf  = np.sum(bin_history * weights[:, np.newaxis], axis=0)  # (frames,)
 
-        # ── 3. Phase unwrap ──────────────────────────────────────────────────
+        # ── 3. Strict DC Removal ─────────────────────────────────────────────
+        # If the target is 'protected', the ClutterMap freezes, allowing a slight 
+        # complex DC offset to build up. This centers the orbital exactly at 0,0.
+        hist_bf -= np.mean(hist_bf)
+
+        # ── 4. Phase unwrap ──────────────────────────────────────────────────
         cand_phase = np.unwrap(np.angle(hist_bf)) * (180.0 / np.pi)   # degrees
 
-        # ── 4. Phase-based micro-state classification ────────────────────────
+        # ── 5. Standard classification features ──────────────────────────────
         n_frames  = len(cand_phase)
         phase_ptp = float(np.ptp(cand_phase))
         phase_var = float(np.var(np.diff(cand_phase)))
         phase_drift = float(abs(cand_phase[-1] - cand_phase[0]))
+        
+        micro_state = None
+        vital_mult  = 1.0
 
+        # ── 6. Classification (Fast Bailouts) ────────────────────────────────
         # Mechanical rotor: monotonically drifting phase ramp
         if phase_drift > _MECH_ROTOR_DRIFT:
             micro_state = MicroState.MECHANICAL_ROTOR
@@ -115,45 +127,42 @@ class VitalFeatureExtractor:
             vital_mult  = 0.1
             self._macro_timers[cand_bin] = 0
 
-        # Gentle micro-motion (breathing-like)
+        # Gentle micro-motion (e.g. speaking, shifting)
         elif phase_var > _MICRO_PHASE_VAR_THRESHOLD:
             micro_state = MicroState.MICRO_PHASE
             vital_mult  = 1.0
             self._macro_timers[cand_bin] = 0
-
+            
         else:
-            # Run full aliveness scoring
+            # We strictly need PSD to tell if it's dead space or breathing
+            force_psd = True
+
+        # ── 7. Heavy PSD + Aliveness (Only if forced or needed) ─────────────
+        aliveness       = 0.0
+        spectral_prom   = 0.0
+        autocorr_q      = 0.0
+        spectral_ent    = 1.0
+        displacement_mm = 0.0
+        
+        if force_psd:
             aliveness, spectral_prom, autocorr_q, spectral_ent, displacement_mm = \
                 self._compute_aliveness(cand_phase, phase_ptp)
+            
+            # If we didn't hit a fast-bailout earlier, use PSD outcome to classify
+            if micro_state is None:
+                micro_state, vital_mult = self._classify_from_aliveness(
+                    aliveness, spectral_prom, autocorr_q, phase_var)
+                self._macro_timers[cand_bin] = 0
 
-            micro_state, vital_mult = self._classify_from_aliveness(
-                aliveness, spectral_prom, autocorr_q, phase_var)
-
-            self._macro_timers[cand_bin] = 0
-
-            return VitalFeatures(
-                phase_ptp           = phase_ptp,
-                displacement_mm     = displacement_mm,
-                phase_variance      = phase_var,
-                phase_drift         = phase_drift,
-                spectral_prominence = spectral_prom,
-                autocorr_quality    = autocorr_q,
-                spectral_entropy    = spectral_ent,
-                aliveness_score     = aliveness,
-                micro_state         = micro_state,
-                vital_multiplier    = vital_mult,
-            )
-
-        # For non-aliveness paths, fill remaining VitalFeatures with phase metrics only
         return VitalFeatures(
             phase_ptp           = phase_ptp,
-            displacement_mm     = 0.0,
+            displacement_mm     = displacement_mm,
             phase_variance      = phase_var,
             phase_drift         = phase_drift,
-            spectral_prominence = 0.0,
-            autocorr_quality    = 0.0,
-            spectral_entropy    = 1.0,
-            aliveness_score     = 0.0,
+            spectral_prominence = spectral_prom,
+            autocorr_quality    = autocorr_q,
+            spectral_entropy    = spectral_ent,
+            aliveness_score     = aliveness,
             micro_state         = micro_state,
             vital_multiplier    = vital_mult,
         )

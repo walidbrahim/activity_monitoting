@@ -425,6 +425,7 @@ class EngineOutput:
     respiration_signal:   RespirationSignal | None   = None
     respiration_metrics:  RespirationMetrics | None  = None
     diagnostics:          dict[str, Any]             = field(default_factory=dict)
+    spectral_history:     Any                        = None  # Exposed for raw debug viz
 
     @property
     def has_target(self) -> bool:

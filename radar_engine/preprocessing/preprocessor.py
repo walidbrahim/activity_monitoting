@@ -149,6 +149,7 @@ class RadarFramePreprocessor(RadarModule):
                 last_target_bin      = self._last_target_bin,
                 track_confidence     = self._track_confidence,
                 confidence_threshold = self.confidence_threshold,
+                target_protection    = self.features.target_protection,
             )
             dynamic_mag_profile = np.sum(np.abs(dynamic_data), axis=1)
 

@@ -65,6 +65,7 @@ class TargetDetector(RadarModule):
         T:                np.ndarray,         # translation vector [x, y, z] metres
         features,
         zone_evaluator:   ZoneEvaluator | None = None,
+        min_search_range_m: float = 0.0,
     ) -> None:
         """
         Args:
@@ -87,8 +88,8 @@ class TargetDetector(RadarModule):
                 "Pass one via the engine\'s cfg.layout."
             )
         self._zone_evaluate = zone_evaluator
-
         self._vital_extractor = VitalFeatureExtractor(frame_rate)
+        self._min_search_range_m = min_search_range_m
 
     # ── RadarModule interface ──────────────────────────────────────────────────
 
@@ -140,6 +141,8 @@ class TargetDetector(RadarModule):
                 mag_profile, cand_bin,
                 window=_CFAR_WINDOW, guard=_CFAR_GUARD, scale=_CFAR_SCALE,
             )
+            cand_range  = cand_bin * self.range_res
+
             if mag < cfar_thresh:
                 candidates.append(TargetCandidate(
                     bin_index=cand_bin, range_m=0.0, x_m=0.0, y_m=0.0, z_m=0.0,
@@ -150,11 +153,32 @@ class TargetDetector(RadarModule):
 
             # ── 3. Localization ───────────────────────────────────────────────
             ch_cand     = corrected_data[cand_bin, :]
-            cand_range  = cand_bin * self.range_res
 
             az, el, x, y, z = estimate_candidate_geometry(ch_cand, cand_range, self.R, self.T)
 
-            # ── 4. Spatial zone gate ──────────────────────────────────────────
+            # ── 3. Min Search Range limit ─────────────────────────────────────
+            if cand_range < self._min_search_range_m:
+                candidates.append(TargetCandidate(
+                    bin_index=cand_bin, range_m=cand_range,
+                    x_m=0.0, y_m=0.0, z_m=0.0, magnitude=mag,
+                    azimuth_rad=0.0, elevation_rad=0.0,
+                    zone="Near Field (Too Close)", valid=False,
+                    cfar_threshold=cfar_thresh,
+                    reject_reason="too_close",
+                ))
+                continue
+
+            # ── 4. Vital features ─────────────────────────────────────────────
+            vital: VitalFeatures | None = None
+            vital_mult = 1.0
+
+            if spectral_history is not None:
+                bin_hist = spectral_history.get_bin_history(cand_bin)
+                vital    = self._vital_extractor.extract(bin_hist, ch_cand, cand_bin)
+                vital_mult = vital.vital_multiplier
+                all_vital[cand_bin] = vital
+
+            # ── 5. Spatial zone gate ──────────────────────────────────────────
             zone_label, is_valid_zone = self._zone_evaluate(x, y, z)
 
             if not is_valid_zone:
@@ -167,16 +191,6 @@ class TargetDetector(RadarModule):
                     reject_reason="out_of_zone",
                 ))
                 continue
-
-            # ── 5. Vital features ─────────────────────────────────────────────
-            vital: VitalFeatures | None = None
-            vital_mult = 1.0
-
-            if spectral_history is not None:
-                bin_hist = spectral_history.get_bin_history(cand_bin)
-                vital    = self._vital_extractor.extract(bin_hist, ch_cand, cand_bin)
-                vital_mult = vital.vital_multiplier
-                all_vital[cand_bin] = vital
 
             # ── 6. Composite score ────────────────────────────────────────────
             # Mirrors original: magnitude × vital_multiplier × range weighting

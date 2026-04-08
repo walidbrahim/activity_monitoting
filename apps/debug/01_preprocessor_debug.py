@@ -24,7 +24,7 @@ import sys, os, math
 import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout,
-    QGridLayout, QGroupBox, QLabel, QSizePolicy,
+    QGridLayout, QGroupBox, QLabel, QSizePolicy, QTabWidget
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTransform
@@ -96,7 +96,7 @@ def _make_heatmap_widget(
     pw      = pg.PlotWidget()
     pw.setBackground(PALETTE["panel"])
     apply_plot_defaults(pw.getPlotItem(), xlabel=xlabel, ylabel=ylabel)
-    pw.getPlotItem().setTitle(title, color=PALETTE["subtext"], size="9pt")
+    pw.getPlotItem().setTitle(title, color=PALETTE["subtext"], size="14pt")
 
     img_item = pg.ImageItem()
     img_item.setColorMap(pg.colormap.get(cmap))
@@ -129,6 +129,15 @@ class PreprocessorDebug(DebugBase):
     _HIST_SECS = 20   # time depth of the heatmaps
 
     def _build_ui(self, central: QWidget) -> None:
+        # ── Setup Parameter Tuner ─────────────────────────────────────────────
+        self.add_tunable_param("preprocessing.clutter_ema_alpha", "Clutter EMA Alpha", 0.001, 1.0, 0.001, self._engine_cfg.preprocessing.clutter_ema_alpha, decimals=3)
+        self.add_tunable_param("preprocessing.static_clutter_margin", "Clutter Margin", 0.0, 5000.0, 10.0, self._engine_cfg.preprocessing.static_clutter_margin, decimals=1)
+        self.add_tunable_param("preprocessing.warmup_frames", "Warmup Frames", 10, 750, 1, self._engine_cfg.preprocessing.warmup_frames, decimals=0)
+        
+        self.add_tunable_param("preprocessing.features_clutter_removal", "ENABLE Clutter Removal", 0, 0, 0, self._engine_cfg.preprocessing.features_clutter_removal)
+        self.add_tunable_param("preprocessing.features_target_protection", "ENABLE Target Protection", 0, 0, 0, self._engine_cfg.preprocessing.features_target_protection)
+
+        # ── UI Construction ───────────────────────────────────────────────────
         outer = QVBoxLayout(central)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
@@ -248,28 +257,68 @@ class PreprocessorDebug(DebugBase):
         dy_lay.addWidget(self._pw_dyn_map)
         maps_row.addWidget(dyn_grp, stretch=1)
 
-        outer.addLayout(maps_row, stretch=5)
+        outer.addLayout(maps_row, stretch=7)
 
         # ── Row 2: SCR chart + warmup ring + diagnostics ──────────────────────
         bottom_row = QHBoxLayout()
 
-        scr_grp  = QGroupBox(f"Signal-to-Clutter Ratio — SCR (rolling {self._HIST_SECS} s)")
-        scr_lay  = QVBoxLayout(scr_grp)
+        # Tabs for I/Q Trace and SCR
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet(f"QTabBar::tab {{ padding: 8px 16px; font-weight: bold; background: {PALETTE['bg']}; color: {PALETTE['text']}; border: 1px solid {PALETTE['panel']}; }} QTabBar::tab:selected {{ background: {PALETTE['panel']}; color: {PALETTE['cyan']}; border-bottom: 2px solid {PALETTE['cyan']}; }}")
+        
+        # Tab 1: I/Q Data Trace
+        iq_tab = QWidget()
+        iq_lay = QHBoxLayout(iq_tab)
+        iq_lay.setContentsMargins(0, 0, 0, 0)
+
+        self._pw_iq = self.make_plot_widget(ylabel="Imaginary (Q)", xlabel="Real (I)")
+        self._pw_iq.setTitle("Protected Bin Phase Rotation")
+        self._pw_iq.setAspectLocked(True) # Force 1:1 aspect ratio for true phase circle
+        self._pw_iq.showGrid(x=True, y=True, alpha=0.3)
+        self._iq_scatter = pg.ScatterPlotItem(size=6, pen=pg.mkPen(None), brush=pg.mkBrush(PALETTE["cyan"]+'cc'))
+        self._pw_iq.addItem(self._iq_scatter)
+        self._iq_line = self._pw_iq.plot(pen=pg.mkPen(PALETTE["cyan"] + '44', width=1)) # Faint connecting line
+        self._pw_iq.addItem(pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen(PALETTE["subtext"]+'88', style=Qt.PenStyle.DashLine)))
+        self._pw_iq.addItem(pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(PALETTE["subtext"]+'88', style=Qt.PenStyle.DashLine)))
+        iq_lay.addWidget(self._pw_iq, stretch=1)
+
+        self._pw_iq_time = self.make_plot_widget(ylabel="Amplitude", xlabel="Time (s)")
+        self._pw_iq_time.setTitle("I and Q Time Evolution")
+        self._pw_iq_time.addLegend(offset=(10, 10))
+        self._pw_iq_time.showGrid(x=True, y=True, alpha=0.3)
+        self._pw_iq_time.setXRange(-20, 0, padding=0)
+        self._pw_iq_time.enableAutoRange(axis='x', enable=False)
+        self._iq_time_i = self._pw_iq_time.plot(pen=pg.mkPen(PALETTE["cyan"], width=2), name="I (Real)")
+        self._iq_time_q = self._pw_iq_time.plot(pen=pg.mkPen(PALETTE["orange"], width=2), name="Q (Imaginary)")
+        iq_lay.addWidget(self._pw_iq_time, stretch=2)
+
+        vitals_grp = QGroupBox("Vitals Assessment")
+        v_lay = QVBoxLayout(vitals_grp)
+        self._lbl_vitals = QLabel("Waiting...")
+        self._lbl_vitals.setStyleSheet(f"font-size: 10pt; font-family: monospace; font-weight: bold; color: {PALETTE['accent']};")
+        v_lay.addWidget(self._lbl_vitals, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        v_lay.addStretch(1)
+        iq_lay.addWidget(vitals_grp, stretch=1)
+
+        self._tabs.addTab(iq_tab, "  I/Q Engine Trace  ")
+
+        # Tab 2: SCR chart
         self._pw_scr    = self.make_plot_widget(ylabel="SCR (dB)", xlabel="Time (s)")
+        self._pw_scr.setTitle(f"Signal-to-Clutter Ratio (rolling {self._HIST_SECS} s)")
         n_scr           = int(self._HIST_SECS * self._frame_rate)
         self._scr_buf   = np.zeros(n_scr)
         self._scr_time  = np.linspace(-self._HIST_SECS, 0, n_scr)
         self._scr_curve = self._pw_scr.plot(
             self._scr_time, self._scr_buf,
             pen=pg.mkPen(PALETTE["cyan"], width=2))
-        # 0 dB reference
         ref_line = pg.InfiniteLine(
             pos=0, angle=0,
             pen=pg.mkPen(PALETTE["subtext"], width=1, style=Qt.PenStyle.DashLine),
             label="0 dB", labelOpts={"color": PALETTE["subtext"], "position": 0.95})
         self._pw_scr.addItem(ref_line)
-        scr_lay.addWidget(self._pw_scr)
-        bottom_row.addWidget(scr_grp, stretch=5)
+        self._tabs.addTab(self._pw_scr, "  SCR History  ")
+        
+        bottom_row.addWidget(self._tabs, stretch=4)
 
         # Warmup ring
         wu_grp  = QGroupBox("Warmup / Calibration")
@@ -294,27 +343,29 @@ class PreprocessorDebug(DebugBase):
         self._lbl_frame    = self._mk("Frame")
         self._lbl_warmup   = self._mk("Warmup")
         self._lbl_alpha    = self._mk("Global α (EMA)")
+        self._lbl_ghost    = self._mk("Ghost Trap MASK")
         self._lbl_raw_peak = self._mk("Raw Peak Mag")
         self._lbl_dyn_peak = self._mk("Dyn Peak Mag")
         self._lbl_scr      = self._mk("Current SCR")
         self._lbl_peak_bin = self._mk("Peak Bin")
         self._lbl_peak_m   = self._mk("Peak Range (m)")
         for i, (k, v) in enumerate([
-            self._lbl_frame, self._lbl_warmup, self._lbl_alpha,
+            self._lbl_frame, self._lbl_warmup, self._lbl_alpha, self._lbl_ghost,
             self._lbl_raw_peak, self._lbl_dyn_peak, self._lbl_scr,
             self._lbl_peak_bin, self._lbl_peak_m,
         ]):
-            diag_lay.addWidget(k, i, 0); diag_lay.addWidget(v, i, 1)
+            diag_lay.addWidget(k, i // 2, (i % 2) * 2)
+            diag_lay.addWidget(v, i // 2, (i % 2) * 2 + 1)
         bottom_row.addWidget(diag_grp, stretch=2)
 
         outer.addLayout(bottom_row, stretch=2)
 
     def _mk(self, label: str):
         k = QLabel(label + ":")
-        k.setStyleSheet(f"color:{PALETTE['subtext']};font-size:11px;")
+        k.setStyleSheet(f"color:{PALETTE['subtext']};font-size:14px;")
         v = QLabel("--")
         v.setStyleSheet(
-            f"font-family:'Courier New',monospace;color:{PALETTE['cyan']};font-size:11px;")
+            f"font-family:'Courier New',monospace;color:{PALETTE['cyan']};font-size:16px;font-weight:bold;")
         return k, v
 
     # ── render ────────────────────────────────────────────────────────────────
@@ -341,30 +392,105 @@ class PreprocessorDebug(DebugBase):
         self._raw_curve.setData(bins, raw_mag)
         self._dyn_curve.setData(bins, dyn_mag)
 
+        # ── Dynamic Limits (Auto-scaling) ─────────────────────────────────────
+        if not hasattr(self, "_clutter_max_limit"): self._clutter_max_limit = 1000.0
+        if not hasattr(self, "_dyn_max_limit"): self._dyn_max_limit = 1000.0
+        
+        c_max = float(clutter_l1.max())
+        d_max = float(dyn_mag.max())
+        
+        # Grow fast, decay slow, but maintain minimum floors so we don't zoom into empty-room noise
+        self._clutter_max_limit = max(c_max, self._clutter_max_limit * 0.99, 1000.0)
+        self._dyn_max_limit = max(d_max, self._dyn_max_limit * 0.99, 500.0)
+
+        # Determine how many temporal frames to shift by matching the engine logic
+        k = getattr(self, "_frames_passed_since_render", 1)
+        k = max(1, min(k, self._clutter_buf.shape[0]))  # Ensure safe clamping
+
         # ── Update buffers & heatmaps ──────────────────────────────────────────
-        self._clutter_buf = np.roll(self._clutter_buf, -1, axis=0)
-        self._clutter_buf[-1] = clutter_l1
-        self._clutter_img.setImage(self._clutter_buf, autoLevels=False)
+        self._clutter_buf = np.roll(self._clutter_buf, -k, axis=0)
+        self._clutter_buf[-k:] = clutter_l1
+        self._clutter_img.setImage(self._clutter_buf, autoLevels=False, levels=(0, max(self._clutter_max_limit, 10.0)))
 
         # ── Dynamic heatmap ──
-        self._dyn_map_buf = np.roll(self._dyn_map_buf, -1, axis=0)
-        self._dyn_map_buf[-1] = dyn_mag
+        self._dyn_map_buf = np.roll(self._dyn_map_buf, -k, axis=0)
+        self._dyn_map_buf[-k:] = dyn_mag
         self._dyn_map_img.setImage(self._dyn_map_buf, autoLevels=False,
-                                   levels=(0, max(float(dyn_mag.max()), 1000)))
+                                   levels=(0, max(self._dyn_max_limit, 10.0)))
 
         # ── α-activity heatmap ──
-        if not hasattr(self, "_prev_clutter"):
-            self._prev_clutter = clutter_l1.copy()
-        delta = np.abs(clutter_l1 - self._prev_clutter)
-        self._prev_clutter = clutter_l1.copy()
-        if not hasattr(self, "_delta_max"):
-            self._delta_max = 1.0
-        self._delta_max = max(self._delta_max * 0.99, float(delta.max()), 1.0)
-        alpha_proxy = (delta / self._delta_max).astype(np.float32)
+        real_alpha = diag.get("clutter_alpha")
+        if real_alpha is not None:
+            # Scale it relative to the global alpha so the visual makes sense 
+            # (Global = Bright, Protected = Black)
+            global_val = self._engine_cfg.preprocessing.clutter_ema_alpha
+            alpha_viz = (real_alpha / max(global_val, 1e-6)).astype(np.float32)
+            alpha_viz = np.clip(alpha_viz, 0.0, 1.0)
+        else:
+            alpha_viz = np.zeros(n, dtype=np.float32)
 
-        self._alpha_buf = np.roll(self._alpha_buf, -1, axis=0)
-        self._alpha_buf[-1] = alpha_proxy
+        self._alpha_buf = np.roll(self._alpha_buf, -k, axis=0)
+        self._alpha_buf[-k:] = alpha_viz
         self._alpha_img.setImage(self._alpha_buf, autoLevels=False)
+
+        # ── I/Q Data Trace ────────────────────────────────────────────────────
+        hist = output.spectral_history
+        if hist is not None and output.tracked_target and output.tracked_target.valid:
+            try:
+                t_bin = output.tracked_target.bin_index
+                iq_buf = hist.get_bin_history(t_bin)
+                if iq_buf is not None and len(iq_buf) > 0:
+                    # Clamp to last 20 seconds
+                    _IQ_SECS = 20
+                    max_iq_frames = int(_IQ_SECS * self._frame_rate)
+                    # iq_buf shape is (num_antennas, num_frames)
+                    iq_c = iq_buf[0, -max_iq_frames:]  # Antenna 0, last 20s
+                    iq_c = iq_c - np.mean(iq_c)  # Zero-mean to center orbital
+                    r, i = np.real(iq_c), np.imag(iq_c)
+
+                    # Parametric phase-plane (I vs Q)
+                    self._iq_scatter.setData(r, i)
+                    self._iq_line.setData(r, i)
+
+                    # scale tightly 1:1
+                    max_amp = max(np.max(np.abs(r)), np.max(np.abs(i))) * 1.2
+                    if np.isnan(max_amp) or max_amp < 1e-3: 
+                        max_amp = 1e-3
+                    self._pw_iq.setXRange(-max_amp, max_amp, padding=0)
+                    self._pw_iq.setYRange(-max_amp, max_amp, padding=0)
+
+                    # Time-domain I and Q (x-axis: last 20 sec window)
+                    n_frames = len(iq_c)
+                    time_idx = np.linspace(-n_frames / self._frame_rate, 0, n_frames)
+                    if time_idx[0] < -20:
+                        # Safety to ensure we don't draw outside -20
+                        time_idx = np.clip(time_idx, -20.0, 0.0)
+                    self._iq_time_i.setData(time_idx, r)
+                    self._iq_time_q.setData(time_idx, i)
+            except Exception as e:
+                pass
+        else:
+            self._iq_scatter.setData([], [])
+            self._iq_line.setData([], [])
+            self._iq_time_i.setData([], [])
+            self._iq_time_q.setData([], [])
+
+        # Vitals display
+        v_text = "No track\n(Standing By)"
+        if output.tracked_target and output.tracked_target.valid:
+            vital = output.diagnostics.get("tracked_vital")
+            if vital:
+                v_text = (
+                    f"Micro-State:  {vital.micro_state.name}\n"
+                    f"Aliveness:    {vital.aliveness_score*100:4.1f}%\n"
+                    f"Phase Var:    {vital.phase_variance:4.2f} rad\n"
+                    f"Phase PtP:    {vital.phase_ptp:4.1f}°\n"
+                    f"Displace:     {vital.displacement_mm:4.1f}mm\n"
+                    f"Vital Mult:   {vital.vital_multiplier:4.2f}x"
+                )
+            else:
+                v_text = "No track\n(Dropped Peak)"
+        self._lbl_vitals.setText(v_text)
 
         # ── SCR ───────────────────────────────────────────────────────────────
         dyn_peak     = float(dyn_mag.max())
@@ -390,6 +516,24 @@ class PreprocessorDebug(DebugBase):
         self._lbl_frame[1].setText(str(output.frame_index))
         self._lbl_warmup[1].setText(
             f"ACTIVE ({warmup_remaining} left)" if warmup_active else "Complete ✓")
+        
+        is_ghost = diag.get("is_static_ghost", False)
+        
+        # Check if alpha actually contains a protection dip
+        is_protected = False
+        if real_alpha is not None and real_alpha.min() < (self._app_cfg.preprocessing.clutter_ema_alpha * 0.1):
+            is_protected = True
+            
+        if is_ghost:
+            self._lbl_ghost[1].setText("DROPPED (Dead/Ghost)")
+            self._lbl_ghost[1].setStyleSheet(f"font-family:'Courier New',monospace;color:{PALETTE['warn']};font-size:16px;font-weight:bold;")
+        elif is_protected:
+            self._lbl_ghost[1].setText("ACTIVE (Protected)")
+            self._lbl_ghost[1].setStyleSheet(f"font-family:'Courier New',monospace;color:{PALETTE['ok']};font-size:16px;font-weight:bold;")
+        else:
+            self._lbl_ghost[1].setText("STANDBY (Empty)")
+            self._lbl_ghost[1].setStyleSheet(f"font-family:'Courier New',monospace;color:{PALETTE['subtext']};font-size:16px;")
+            
         alpha_cfg = self._app_cfg.preprocessing.clutter_ema_alpha
         self._lbl_alpha[1].setText(f"{alpha_cfg:.4f}")
         self._lbl_raw_peak[1].setText(f"{float(raw_mag.max()):.1f}")

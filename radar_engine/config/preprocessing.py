@@ -36,3 +36,4 @@ class PreprocessingConfig:
     features_adaptive_smoothing:   bool = True
     features_fall_posture:         bool = True
     features_apnea_state:          bool = True
+    features_target_protection:    bool = True

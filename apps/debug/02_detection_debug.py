@@ -58,6 +58,12 @@ class DetectionDebug(DebugBase):
     _HIST_SECS = 20      # history raster depth in seconds
 
     def _build_ui(self, central: QWidget) -> None:
+        # ── Setup Parameter Tuner ─────────────────────────────────────────────
+        self.add_tunable_param("detection.cfar_scale", "CFAR Scale", 0.5, 5.0, 0.1, self._engine_cfg.detection.cfar_scale, decimals=2)
+        self.add_tunable_param("detection.detection_threshold", "Absolute Threshold", 0.0, 5000.0, 50.0, self._engine_cfg.detection.detection_threshold, decimals=1)
+        self.add_tunable_param("detection.min_search_range_m", "Min Search Range", 0.0, 3.0, 0.1, self._engine_cfg.detection.min_search_range_m, decimals=2)
+
+        # ── UI Construction ───────────────────────────────────────────────────
         grid = QGridLayout(central)
         grid.setContentsMargins(10, 10, 10, 10)
         grid.setSpacing(10)
